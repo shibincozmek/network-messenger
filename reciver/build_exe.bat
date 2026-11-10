@@ -1,9 +1,7 @@
 @echo off
 setlocal
-REM Builds the scanner app and the standalone receiver app into .exe files.
-REM Run this ON WINDOWS, in the same folder as:
-REM   lan_core.py, lan_messenger.py  (used together, for the scanner)
-REM   lan_receiver.py                (fully standalone, for the receiver)
+REM Builds the single unified LAN Chat app into one .exe.
+REM Run this ON WINDOWS, in the same folder as lan_chat.py.
 REM Double-click it, or run it from a Command Prompt.
 
 echo ============================================
@@ -23,24 +21,14 @@ python --version
 echo.
 
 echo ============================================
-echo Confirming the script files are here...
+echo Confirming Netchat.py is here...
 echo ============================================
-if not exist lan_core.py (
-    echo ERROR: lan_core.py not found. Needed by lan_messenger.py.
+if not exist Netchat.py (
+    echo ERROR: Netchat.py not found in this folder.
     pause
     exit /b 1
 )
-if not exist lan_messenger.py (
-    echo ERROR: lan_messenger.py not found in this folder.
-    pause
-    exit /b 1
-)
-if not exist lan_receiver.py (
-    echo ERROR: lan_receiver.py not found in this folder.
-    pause
-    exit /b 1
-)
-echo OK - all files found.
+echo OK.
 echo.
 
 echo ============================================
@@ -57,13 +45,12 @@ if %errorlevel% neq 0 (
 echo.
 
 echo ============================================
-echo Building LAN_Messenger.exe (scanner + sender) ...
+echo Building LAN_Chat.exe ...
 echo ============================================
-python -m PyInstaller --onefile --windowed --name LAN_Messenger lan_messenger.py
+python -m PyInstaller --onefile --windowed --name LAN_Chat Netchat.py
 if %errorlevel% neq 0 (
     echo.
-    echo ERROR: Build failed for lan_messenger.py - scroll up for the actual
-    echo PyInstaller error message.
+    echo ERROR: Build failed - scroll up for the actual PyInstaller error message.
     echo.
     pause
     exit /b 1
@@ -71,22 +58,7 @@ if %errorlevel% neq 0 (
 echo.
 
 echo ============================================
-echo Building LAN_Receiver.exe (receive + reply only, single file) ...
-echo ============================================
-python -m PyInstaller --onefile --windowed --name LAN_Receiver lan_receiver.py
-if %errorlevel% neq 0 (
-    echo.
-    echo ERROR: Build failed for lan_receiver.py - scroll up for the actual
-    echo PyInstaller error message.
-    echo.
-    pause
-    exit /b 1
-)
-echo.
-
-echo ============================================
-echo SUCCESS. Find the .exe files here:
-echo   dist\LAN_Messenger.exe   (for you - scan + send)
-echo   dist\LAN_Receiver.exe    (hand out to everyone else - receive + reply)
+echo SUCCESS. Find it here:
+echo   dist\LAN_Chat.exe
 echo ============================================
 pause
