@@ -1,0 +1,77 @@
+LAN Chat - Change Summary
+========================
+
+This note summarizes the fixes and additions made to Netchat.py and their
+purpose. Existing TCP chat and message formats were kept intact.
+
+Audio recording and playback
+----------------------------
+- Fixed AudioRecorder initialization. Its constructor previously tried to
+  create another AudioRecorder recursively, which could prevent the app from
+  starting when audio support was installed.
+- Added a recording timer/status indicator and a clear stop-recording button
+  label so users can tell when audio is being recorded and for how long.
+- Added voice-message playback controls that show elapsed and total time,
+  allow playback to be stopped, and reset when playback ends.
+- Improved WAV validation and playback error reporting so invalid or
+  unsupported audio is reported instead of failing silently.
+- Ensured recording timer callbacks are cancelled when recording ends or the
+  app closes, preventing an old timeout from affecting a later recording.
+
+Media controls and Windows build
+-------------------------------
+- Made the image and voice buttons larger and gave them clearer labels to make
+  their purpose easier to identify.
+- Updated build_exe.bat to install Pillow, NumPy, and sounddevice, which the
+  app uses for image and audio features when building the Windows executable.
+
+Network scanning and discovery
+------------------------------
+- Added a separate DiscoveryListener on UDP port 50506. It starts with the
+  application, answers JSON discovery requests, and stops when the app closes.
+- Discovery replies include the device name and existing TCP port 50505. The
+  discovered IP is taken from the UDP packet sender address, not trusted from
+  the request payload.
+- Added active-interface subnet detection where available and broadcast
+  requests to that subnet's directed broadcast address, with
+  255.255.255.255 as a fallback.
+- Updated the existing Scan Network operation to listen for UDP responses for
+  approximately 3.5 seconds and merge results with the existing ARP/ping scan.
+  ARP and ping remain as fallback discovery methods.
+- Merged scan results by IP address so a device found by multiple methods
+  doesn't create duplicate contacts.
+- Stored last-seen timestamps and mark contacts offline after 120 seconds
+  without a successful scan or incoming message. Existing chat history and
+  unread state are preserved when contact details are updated.
+- Kept scanning work off the Tkinter main thread and scheduled UI changes via
+  root.after().
+
+Why discovery was added
+-----------------------
+The previous scan relied on ARP and ping results and assumed a /24 subnet.
+Those methods can miss devices that are still running the app and able to
+receive TCP messages. UDP broadcast discovery provides an additional way for
+running app instances on the same LAN to find one another; it supplements
+rather than replaces the existing scan.
+
+Ports and firewall
+------------------
+- TCP 50505 remains the port for messages.
+- UDP 50506 is used only for discovery.
+- On Windows, allow inbound UDP 50506 on the Private profile for discovery.
+  For example, in elevated PowerShell:
+
+  New-NetFirewallRule -DisplayName "LAN Chat Discovery UDP 50506" `
+    -Direction Inbound -Protocol UDP -LocalPort 50506 -Action Allow `
+    -Profile Private
+
+  Keep the existing inbound TCP 50505 rule enabled. Broadcast discovery may
+  still be restricted by guest Wi-Fi, VLAN boundaries, or client isolation.
+
+Validation performed
+--------------------
+- Pylance syntax check and Python py_compile passed.
+- Local UDP discovery request/reply was tested.
+- Contact deduplication, unread/history preservation, and stale-contact
+  offline marking were tested.
+- Testing across physical devices and real audio hardware was not performed.

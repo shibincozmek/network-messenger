@@ -55,9 +55,12 @@ except ImportError:
     HAVE_AUDIO = False
 
 APP_PORT = 50505
+DISCOVERY_PORT = 50506
 GLOBAL_KEY = "__global__"  # special "contact" id for the broadcast thread
 MAX_IMAGE_DIM = 1024       # longest side an image is resized to before sending
 MAX_VOICE_SECONDS = 30     # recording auto-stops after this long
+DISCOVERY_TIMEOUT = 3.5
+CONTACT_OFFLINE_AFTER = 120
 
 _IS_WINDOWS = platform.system().lower() == "windows"
 # Suppress the console window Windows otherwise flashes for every
@@ -227,6 +230,63 @@ class MessageListener(threading.Thread):
         self._stop_event.set()
 
 
+class DiscoveryListener(threading.Thread):
+    """UDP responder for discovering other LAN Chat instances."""
+
+    def __init__(self, on_error=None, port=DISCOVERY_PORT):
+        super().__init__(daemon=True)
+        self.on_error = on_error
+        self.port = port
+        self._stop_event = threading.Event()
+
+    def run(self):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as srv:
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("", self.port))
+                srv.settimeout(0.5)
+                while not self._stop_event.is_set():
+                    try:
+                        raw, sender = srv.recvfrom(65535)
+                    except socket.timeout:
+                        continue
+                    except OSError as e:
+                        if not self._stop_event.is_set():
+                            self._report_error(f"UDP discovery listener failed: {e}")
+                        break
+
+                    try:
+                        request = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(request, dict) or request.get("type") != "DISCOVERY_REQUEST":
+                        continue
+
+                    response = {
+                        "type": "DISCOVERY_RESPONSE",
+                        "device_name": socket.gethostname(),
+                        "tcp_port": APP_PORT,
+                    }
+                    try:
+                        srv.sendto(json.dumps(response).encode("utf-8"), sender)
+                    except OSError as e:
+                        if not self._stop_event.is_set():
+                            self._report_error(f"Could not send UDP discovery response: {e}")
+        except OSError as e:
+            if not self._stop_event.is_set():
+                self._report_error(
+                    f"UDP discovery is unavailable on port {self.port}: {e}. "
+                    "Check firewall rules or whether another app is using the port."
+                )
+
+    def _report_error(self, message):
+        if self.on_error is not None:
+            self.on_error(message)
+
+    def stop(self):
+        self._stop_event.set()
+
+
 # ----------------------------------------------------------------------
 # Networking: discovery / scanning
 # ----------------------------------------------------------------------
@@ -286,8 +346,129 @@ def guess_best_ip(candidates, fallback_ip):
 def get_subnet_cidr():
     fallback_ip = get_local_ip()
     local_ip = guess_best_ip(get_all_ipv4_candidates(), fallback_ip)
+    interface_cidr = get_interface_cidr(local_ip)
+    if interface_cidr:
+        return interface_cidr, local_ip
     parts = local_ip.split(".")
     return ".".join(parts[:3]) + ".0/24", local_ip
+
+
+def get_interface_cidr(local_ip):
+    """Find the selected IPv4 interface's prefix when the OS exposes it."""
+    try:
+        if _IS_WINDOWS:
+            result = subprocess.run(
+                ["ipconfig"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=_SUBPROCESS_FLAGS,
+            )
+            interface_ip = None
+            for line in result.stdout.splitlines():
+                ip_match = re.search(r"IPv4 Address[.\s]*:\s*([\d.]+)", line)
+                if ip_match:
+                    interface_ip = ip_match.group(1)
+                mask_match = re.search(r"Subnet Mask[.\s]*:\s*([\d.]+)", line)
+                if interface_ip == local_ip and mask_match:
+                    interface = ipaddress.IPv4Interface(
+                        f"{local_ip}/{mask_match.group(1)}"
+                    )
+                    return str(interface.network)
+                if interface_ip is not None and line and not line[0].isspace():
+                    interface_ip = None
+        else:
+            result = subprocess.run(
+                ["ip", "-o", "-f", "inet", "addr", "show"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            for match in re.finditer(r"\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)", result.stdout):
+                interface = ipaddress.IPv4Interface(match.group(1))
+                if str(interface.ip) == local_ip:
+                    return str(interface.network)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return None
+
+
+def _discovery_broadcast_addresses(local_ip, cidr):
+    addresses = []
+    interface_cidr = get_interface_cidr(local_ip)
+    candidates = [interface_cidr, cidr]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            network = ipaddress.ip_network(candidate, strict=False)
+            if isinstance(network, ipaddress.IPv4Network) and network.prefixlen < 31:
+                address = str(network.broadcast_address)
+                if address not in addresses:
+                    addresses.append(address)
+        except ValueError:
+            continue
+    if "255.255.255.255" not in addresses:
+        addresses.append("255.255.255.255")
+    return addresses
+
+
+def discover_devices(local_ip, cidr, timeout=DISCOVERY_TIMEOUT, log_cb=None):
+    """Broadcast a discovery request and collect valid replies for a short window."""
+    request = {
+        "type": "DISCOVERY_REQUEST",
+        "device_name": socket.gethostname(),
+        "tcp_port": APP_PORT,
+    }
+    payload = json.dumps(request).encode("utf-8")
+    devices = {}
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        client.settimeout(0.25)
+        for broadcast_ip in _discovery_broadcast_addresses(local_ip, cidr):
+            try:
+                client.sendto(payload, (broadcast_ip, DISCOVERY_PORT))
+            except OSError as e:
+                if log_cb:
+                    log_cb(f"UDP discovery broadcast to {broadcast_ip} failed: {e}")
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                raw, sender = client.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError as e:
+                if log_cb:
+                    log_cb(f"UDP discovery receive failed: {e}")
+                break
+
+            try:
+                response = json.loads(raw.decode("utf-8"))
+                if not isinstance(response, dict) or response.get("type") != "DISCOVERY_RESPONSE":
+                    continue
+                device_name = response.get("device_name")
+                tcp_port = response.get("tcp_port")
+                if not isinstance(device_name, str) or not device_name.strip():
+                    continue
+                if isinstance(tcp_port, bool) or not isinstance(tcp_port, int):
+                    continue
+                if tcp_port != APP_PORT:
+                    continue
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+
+            devices[sender[0]] = {
+                "ip": sender[0],
+                "hostname": device_name.strip(),
+                "tcp_port": tcp_port,
+                "is_self": sender[0] == local_ip,
+                "last_seen": time.time(),
+                "discovered_by_udp": True,
+            }
+    if log_cb:
+        log_cb(f"UDP discovery found {len(devices)} device(s).")
+    return list(devices.values())
 
 
 def ping(ip, fail_counter=None, fail_lock=None):
@@ -458,6 +639,9 @@ class ChatApp:
 
         self.listener = MessageListener(self.on_message)
         self.listener.start()
+        self.discovery_listener = DiscoveryListener(on_error=self.log)
+        self.discovery_listener.start()
+        self._contact_expiry_id = self.root.after(30_000, self._expire_stale_contacts)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # -- UI construction --------------------------------------------------
@@ -828,14 +1012,36 @@ class ChatApp:
 
         try:
             _, local_ip = get_subnet_cidr()
-            devices = scan_network(cidr, local_ip, progress_cb=progress, log_cb=self.log)
+            self.root.after(0, lambda: self.status_var.set("Discovering devices over UDP..."))
+            try:
+                discovered_devices = discover_devices(local_ip, cidr, log_cb=self.log)
+            except OSError as e:
+                self.log(f"UDP discovery failed; continuing with ARP/ping scan: {e}")
+                discovered_devices = []
+            devices_by_ip = {device["ip"]: device for device in discovered_devices}
+            try:
+                arp_devices = scan_network(cidr, local_ip, progress_cb=progress, log_cb=self.log)
+            except Exception as e:
+                self.log(f"ARP/ping scan failed; keeping UDP discovery results: {e}")
+                arp_devices = []
+
+            for device in arp_devices:
+                devices_by_ip.setdefault(device["ip"], device)
+
             self.root.after(
                 0, lambda: self.status_var.set("Checking which devices are reachable for messaging...")
             )
-            for d in devices:
-                d["reachable"] = "self" if d["is_self"] else (
-                    "yes" if check_listener_running(d["ip"]) else "no"
-                )
+            for device in devices_by_ip.values():
+                if device["is_self"]:
+                    device["reachable"] = "self"
+                else:
+                    device["reachable"] = "yes" if check_listener_running(device["ip"]) else "no"
+                    if device["reachable"] == "yes":
+                        device.setdefault("last_seen", time.time())
+            devices = sorted(
+                devices_by_ip.values(),
+                key=lambda device: tuple(int(part) for part in device["ip"].split(".")),
+            )
             self.root.after(0, lambda: self._apply_scan_results(devices))
         except Exception as e:
             self.log(f"Network scan failed: {e}")
@@ -850,14 +1056,35 @@ class ChatApp:
     def _apply_scan_results(self, devices):
         for d in devices:
             existing = self.contacts.get(d["ip"], {})
-            self.contacts[d["ip"]] = {
-                "hostname": d["hostname"],
-                "reachable": d["reachable"],
-                "unread": existing.get("unread", False),
-            }
+            contact = existing.copy()
+            discovered_name = d.get("hostname")
+            if discovered_name and discovered_name != "Unknown device":
+                contact["hostname"] = discovered_name
+            else:
+                contact.setdefault("hostname", "Unknown device")
+            contact["reachable"] = d["reachable"]
+            contact["unread"] = existing.get("unread", False)
+            contact["last_seen"] = d.get("last_seen", existing.get("last_seen"))
+            self.contacts[d["ip"]] = contact
         self._refresh_contact_list()
         self.status_var.set(f"Found {len(devices)} device(s).")
         self.scan_btn.config(state="normal")
+
+    def _expire_stale_contacts(self):
+        now = time.time()
+        changed = False
+        for contact in self.contacts.values():
+            last_seen = contact.get("last_seen")
+            if (
+                contact.get("reachable") == "yes"
+                and isinstance(last_seen, (int, float))
+                and now - last_seen > CONTACT_OFFLINE_AFTER
+            ):
+                contact["reachable"] = "no"
+                changed = True
+        if changed:
+            self._refresh_contact_list()
+        self._contact_expiry_id = self.root.after(30_000, self._expire_stale_contacts)
 
     # -- Sending ----------------------------------------------------------
 
@@ -1054,9 +1281,17 @@ class ChatApp:
         # the list and can be replied to privately - but WHERE the message
         # itself is shown depends on scope.
         if sender_ip not in self.contacts:
-            self.contacts[sender_ip] = {"hostname": display_name, "reachable": "yes", "unread": False}
+            self.contacts[sender_ip] = {
+                "hostname": display_name,
+                "reachable": "yes",
+                "unread": False,
+                "last_seen": time.time(),
+            }
         else:
             self.contacts[sender_ip]["reachable"] = "yes"
+            self.contacts[sender_ip]["last_seen"] = time.time()
+            if self.contacts[sender_ip].get("hostname") == "Unknown device":
+                self.contacts[sender_ip]["hostname"] = display_name
 
         if msgtype == "text":
             entry = {"who": display_name, "kind": "text", "text": data.get("text", "")}
@@ -1102,8 +1337,13 @@ class ChatApp:
                 self.log(f"Could not stop recording during shutdown: {e}")
         if self._playing_voice_entry is not None:
             self._stop_voice_playback()
+        if self._contact_expiry_id is not None:
+            self.root.after_cancel(self._contact_expiry_id)
+            self._contact_expiry_id = None
         self.listener.stop()
         self.listener.join(timeout=1.5)
+        self.discovery_listener.stop()
+        self.discovery_listener.join(timeout=1.5)
         self.root.destroy()
 
 
