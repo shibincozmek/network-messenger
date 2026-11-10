@@ -1,7 +1,7 @@
 @echo off
 setlocal
 REM Builds the single unified LAN Chat app into one .exe.
-REM Run this ON WINDOWS, in the same folder as lan_chat.py.
+REM Run this ON WINDOWS, in the same folder as Netchat.py.
 REM Double-click it, or run it from a Command Prompt.
 
 echo ============================================
@@ -32,9 +32,9 @@ echo OK.
 echo.
 
 echo ============================================
-echo Installing/upgrading PyInstaller...
+echo Installing/upgrading PyInstaller and media dependencies...
 echo ============================================
-python -m pip install --upgrade pyinstaller
+python -m pip install --upgrade pyinstaller pillow numpy sounddevice
 if %errorlevel% neq 0 (
     echo.
     echo ERROR: pip install failed - see the message above.

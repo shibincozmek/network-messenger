@@ -16,8 +16,11 @@ SCOPE / HONESTY NOTES (kept from the earlier versions, still true):
   version using the same protocol on port 50505). There is no way to
   push a message onto a device that hasn't opted in by running it.
 
-Standard library only - nothing to pip install, and this single file
-is all PyInstaller needs to build one .exe.
+Text chat needs only the standard library. Images and voice messages
+need two extra pip packages (Pillow for images; sounddevice + numpy
+for audio) - if those aren't installed, text chat still works fully
+and the Image/Voice buttons just explain what to install. Build with
+build_exe.bat, which installs these before bundling the .exe.
 """
 
 import socket
@@ -26,12 +29,35 @@ import threading
 import platform
 import re
 import json
+import io
+import os
+import base64
+import tempfile
+import wave
 import ipaddress
+import math
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+import time
+
+
+try:
+    from PIL import Image, ImageTk
+    HAVE_PIL = True
+except ImportError:
+    HAVE_PIL = False
+
+try:
+    import numpy as np
+    import sounddevice as sd
+    HAVE_AUDIO = True
+except ImportError:
+    HAVE_AUDIO = False
 
 APP_PORT = 50505
 GLOBAL_KEY = "__global__"  # special "contact" id for the broadcast thread
+MAX_IMAGE_DIM = 1024       # longest side an image is resized to before sending
+MAX_VOICE_SECONDS = 30     # recording auto-stops after this long
 
 _IS_WINDOWS = platform.system().lower() == "windows"
 # Suppress the console window Windows otherwise flashes for every
@@ -43,21 +69,104 @@ _SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0
 # Networking: messaging protocol
 # ----------------------------------------------------------------------
 
-def send_message(ip, text, anonymous=True, display_name=None, scope="private", port=APP_PORT, timeout=3):
-    """
-    scope: "private" (a normal 1:1 message, shown in that contact's thread)
-           or "global" (a broadcast - the recipient shows it in their
-           shared Global thread, not mixed into a private conversation).
-    """
-    payload = {
+def _envelope(anonymous, display_name, scope, msgtype):
+    return {
         "type": "msg",
-        "scope": scope,
+        "msgtype": msgtype,  # "text" | "image" | "voice"
+        "scope": scope,       # "private" (that contact's thread) or "global" (shared broadcast thread)
         "anonymous": anonymous,
         "name": "Anonymous" if anonymous else (display_name or socket.gethostname()),
-        "text": text,
     }
+
+
+def _send_payload(ip, payload, port, timeout):
+    raw = json.dumps(payload).encode("utf-8")
     with socket.create_connection((ip, port), timeout=timeout) as s:
-        s.sendall(json.dumps(payload).encode("utf-8"))
+        s.sendall(raw)
+
+
+def send_text(ip, text, anonymous=True, display_name=None, scope="private", port=APP_PORT, timeout=5):
+    payload = _envelope(anonymous, display_name, scope, "text")
+    payload["text"] = text
+    _send_payload(ip, payload, port, timeout)
+
+
+def send_image(ip, image_bytes, filename, anonymous=True, display_name=None, scope="private",
+                port=APP_PORT, timeout=15):
+    payload = _envelope(anonymous, display_name, scope, "image")
+    payload["filename"] = filename
+    payload["data_b64"] = base64.b64encode(image_bytes).decode("ascii")
+    _send_payload(ip, payload, port, timeout)
+
+
+def send_voice(ip, wav_bytes, duration, anonymous=True, display_name=None, scope="private",
+                port=APP_PORT, timeout=15):
+    payload = _envelope(anonymous, display_name, scope, "voice")
+    payload["duration"] = duration
+    payload["data_b64"] = base64.b64encode(wav_bytes).decode("ascii")
+    _send_payload(ip, payload, port, timeout)
+
+
+def prepare_image_bytes(path):
+    """Resize/compress an arbitrary image file down to send-friendly JPEG bytes."""
+    if not HAVE_PIL:
+        raise RuntimeError("Pillow is not installed")
+    img = Image.open(path)
+    img = img.convert("RGB")
+    img.thumbnail((MAX_IMAGE_DIM, MAX_IMAGE_DIM))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=82)
+    return buf.getvalue()
+
+
+class AudioRecorder:
+    """Simple start/stop microphone recorder -> WAV bytes (needs sounddevice + numpy)."""
+
+    def __init__(self, samplerate=16000, channels=1):
+        self.samplerate = samplerate
+        self.channels = channels
+        self._frames = []
+        self._stream = None
+
+    def start(self):
+        if not HAVE_AUDIO:
+            raise RuntimeError("sounddevice and numpy are required to record audio")
+        if self._stream is not None:
+            raise RuntimeError("A recording is already in progress")
+
+        self._frames = []
+
+        def callback(indata, frames, time_info, status):
+            self._frames.append(indata.copy())
+
+        stream = sd.InputStream(samplerate=self.samplerate, channels=self.channels,
+                                dtype="int16", callback=callback)
+        try:
+            stream.start()
+        except Exception:
+            stream.close()
+            raise
+        self._stream = stream
+
+    def stop(self):
+        stream = self._stream
+        self._stream = None
+        if stream is not None:
+            try:
+                stream.stop()
+            finally:
+                stream.close()
+        if not self._frames:
+            return b"", 0.0
+        data = np.concatenate(self._frames, axis=0)
+        duration = len(data) / self.samplerate
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(self.channels)
+            wf.setsampwidth(2)  # int16
+            wf.setframerate(self.samplerate)
+            wf.writeframes(data.tobytes())
+        return buf.getvalue(), duration
 
 
 def check_listener_running(ip, port=APP_PORT, timeout=0.4):
@@ -70,13 +179,13 @@ def check_listener_running(ip, port=APP_PORT, timeout=0.4):
 
 
 class MessageListener(threading.Thread):
-    """Background TCP server; calls on_message(sender_ip, name, text)."""
+    """Background TCP server; calls on_message(sender_ip, parsed_json_dict)."""
 
     def __init__(self, on_message, port=APP_PORT):
         super().__init__(daemon=True)
         self.on_message = on_message
         self.port = port
-        self._stop = False
+        self._stop_event = threading.Event()
 
     def run(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -84,7 +193,7 @@ class MessageListener(threading.Thread):
         srv.bind(("0.0.0.0", self.port))
         srv.listen(5)
         srv.settimeout(1.0)
-        while not self._stop:
+        while not self._stop_event.is_set():
             try:
                 conn, addr = srv.accept()
             except socket.timeout:
@@ -92,10 +201,10 @@ class MessageListener(threading.Thread):
             except OSError:
                 break
             try:
-                conn.settimeout(3)
+                conn.settimeout(10)  # images/voice clips are bigger than a text ping
                 chunks = []
                 while True:
-                    chunk = conn.recv(4096)
+                    chunk = conn.recv(65536)
                     if not chunk:
                         break
                     chunks.append(chunk)
@@ -109,14 +218,13 @@ class MessageListener(threading.Thread):
                 if data.get("type") == "ping":
                     continue
                 if data.get("type") == "msg":
-                    self.on_message(addr[0], data.get("name", "Anonymous"), data.get("text", ""),
-                                     data.get("scope", "private"))
+                    self.on_message(addr[0], data)
             finally:
                 conn.close()
         srv.close()
 
     def stop(self):
-        self._stop = True
+        self._stop_event.set()
 
 
 # ----------------------------------------------------------------------
@@ -182,24 +290,38 @@ def get_subnet_cidr():
     return ".".join(parts[:3]) + ".0/24", local_ip
 
 
-def ping(ip):
+def ping(ip, fail_counter=None, fail_lock=None):
+    """
+    Returns True/False for a normal ping result. If launching ping.exe
+    itself raises an exception (blocked by AV/security policy, missing
+    binary, etc.) that's tracked separately via fail_counter so the
+    caller can tell "nobody answered" apart from "couldn't even try."
+    """
     param = "-n" if _IS_WINDOWS else "-c"
     timeout_flag = "-w" if _IS_WINDOWS else "-W"
     timeout_val = "500" if _IS_WINDOWS else "1"
     try:
-        subprocess.run(["ping", param, "1", timeout_flag, timeout_val, ip],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
-                        creationflags=_SUBPROCESS_FLAGS)
-    except Exception:
-        pass
+        result = subprocess.run(["ping", param, "1", timeout_flag, timeout_val, ip],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+                                 creationflags=_SUBPROCESS_FLAGS)
+        return result.returncode == 0
+    except Exception as e:
+        if fail_counter is not None and fail_lock is not None:
+            with fail_lock:
+                fail_counter["errors"] += 1
+                fail_counter["last_error"] = str(e)
+        return False
 
 
-def sweep_subnet(cidr, progress_cb=None):
+def sweep_subnet(cidr, progress_cb=None, log_cb=None):
     net = ipaddress.ip_network(cidr, strict=False)
     hosts = list(net.hosts())
     threads = []
+    fail_counter = {"errors": 0, "last_error": ""}
+    fail_lock = threading.Lock()
+
     for i, ip in enumerate(hosts):
-        t = threading.Thread(target=ping, args=(str(ip),), daemon=True)
+        t = threading.Thread(target=ping, args=(str(ip), fail_counter, fail_lock), daemon=True)
         threads.append(t)
         t.start()
         if len(threads) >= 40:
@@ -210,6 +332,13 @@ def sweep_subnet(cidr, progress_cb=None):
             progress_cb(i + 1, len(hosts))
     for th in threads:
         th.join(timeout=2)
+
+    if log_cb and fail_counter["errors"] > 0:
+        pct = fail_counter["errors"] * 100 // max(len(hosts), 1)
+        log_cb(f"WARNING: ping.exe itself failed to launch on {fail_counter['errors']}/{len(hosts)} "
+               f"attempts ({pct}%) - error: {fail_counter['last_error']}. "
+               "If this is high, antivirus/endpoint protection or a restricted user account "
+               "is likely blocking the scan on this machine, not an empty network.")
 
 
 def read_arp_table():
@@ -250,7 +379,7 @@ def scan_network(cidr, local_ip, progress_cb=None, log_cb=None):
             log_cb(msg)
 
     log(f"Local IP guessed as {local_ip}, sweeping {cidr} ...")
-    sweep_subnet(cidr, progress_cb)
+    sweep_subnet(cidr, progress_cb, log_cb=log_cb)
     arp = read_arp_table()
     log(f"ARP table has {len(arp)} total entries (all adapters).")
 
@@ -304,12 +433,26 @@ class ChatApp:
         root.geometry("920x640")
         root.minsize(760, 520)
 
-        # chats[key] = list of (who, text) tuples; key is an IP, or GLOBAL_KEY
+        # chats[key] = list of entry dicts; key is an IP, or GLOBAL_KEY.
+        # entry = {"who":..., "kind": "text"/"image"/"voice", ...kind-specific fields}
         self.chats = {GLOBAL_KEY: []}
         # contacts[ip] = {"hostname":..., "reachable": "yes"/"no"/"self", "unread": bool}
         self.contacts = {}
         self.selected_key = GLOBAL_KEY
         self.global_unread = False
+        self._media_photo_refs = []  # keeps PhotoImage objects alive while shown
+
+        self.recorder = AudioRecorder() if HAVE_AUDIO else None
+        self.is_recording = False
+        self.recording_started_at = None
+        self.recording_timer_id = None
+        self.recording_auto_stop_id = None
+        self.voice_status_var = tk.StringVar(value="")
+        self._playing_voice_entry = None
+        self._active_voice_button = None
+        self._playback_started_at = None
+        self._playback_timer_id = None
+        self._playback_generation = 0
 
         self._build_ui()
 
@@ -371,18 +514,74 @@ class ChatApp:
         self.transcript.tag_configure("meta", foreground="#888")
 
         composer = ttk.Frame(right)
-        composer.pack(fill="x")
-        self.msg_entry = ttk.Entry(composer)
-        self.msg_entry.pack(side="left", fill="x", expand=True)
-        self.msg_entry.bind("<Return>", lambda e: self.send_current())
-        self.anon_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(composer, text="Anonymous", variable=self.anon_var).pack(side="left", padx=5)
-        self.send_btn = ttk.Button(composer, text="Send", command=self.send_current)
-        self.send_btn.pack(side="left")
+        composer.pack(fill="x", padx=8, pady=8)
 
+# Message input
+        self.msg_entry = ttk.Entry(composer)
+        self.msg_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.msg_entry.bind("<Return>", lambda e: self.send_current())
+
+# Anonymous option
+        self.anon_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            composer,
+            text="Anonymous",
+            variable=self.anon_var
+            ).pack(side="left", padx=5)
+
+# Image button
+        self.image_btn = ttk.Button(
+             composer,
+             text="📷  Send image",
+             command=self.pick_image,
+             width=16,
+             padding=(8, 6)
+                )
+        self.image_btn.pack(side="left", padx=(4, 4))
+
+# Voice recording button
+        self.voice_btn = ttk.Button(
+            composer,
+            text="🎙  Record voice",
+            command=self.toggle_recording,
+            width=17,
+            padding=(8, 6)
+                    )
+        self.voice_btn.pack(side="left", padx=(0, 4))
+        ttk.Label(
+            composer,
+            textvariable=self.voice_status_var,
+            foreground="#c01c28",
+            font=("Segoe UI", 10, "bold")
+        ).pack(side="left", padx=(2, 6))
+
+# Send button
+        self.send_btn = ttk.Button(
+            composer,
+            text="  ➤ Send  ",
+            command=self.send_current
+            )
+        self.send_btn.pack(side="left", padx=(0, 4))
+
+# Check feature availability
+        if not HAVE_PIL:
+            self.image_btn.config(text="📷  Image unavailable", state="disabled")
+
+        if not HAVE_AUDIO:
+            self.voice_btn.config(text="🎙  Audio unavailable", state="disabled")
+
+
+# Diagnostics log
         log_frame = ttk.LabelFrame(root, text="Diagnostics log", padding=4)
         log_frame.pack(fill="x", padx=8, pady=(0, 8))
-        self.log_text = tk.Text(log_frame, height=4, wrap="word", state="disabled", font=("Consolas", 9))
+
+        self.log_text = tk.Text(
+                log_frame,
+                height=4,
+                wrap="word",
+                state="disabled",
+                font=("Consolas", 9)
+                )
         self.log_text.pack(fill="x")
 
     # -- Contact list helpers ---------------------------------------------
@@ -431,16 +630,173 @@ class ChatApp:
             self.chat_title_var.set(f"{c['hostname']} ({key})")
 
         self.transcript.config(state="normal")
+        self._active_voice_button = None
         self.transcript.delete("1.0", "end")
-        for who, text in self.chats.get(key, []):
+        self._media_photo_refs = []  # rebuilt below; old PhotoImages can be dropped now
+        for entry in self.chats.get(key, []):
+            who = entry.get("who", "?")
             tag = "me" if who == "You" else "them"
             self.transcript.insert("end", f"{who}: ", ("meta",))
-            self.transcript.insert("end", f"{text}\n", (tag,))
+            kind = entry.get("kind", "text")
+            if kind == "text":
+                self.transcript.insert("end", f"{entry.get('text', '')}\n", (tag,))
+            elif kind == "image":
+                self._insert_image(entry)
+                self.transcript.insert("end", "\n")
+            elif kind == "voice":
+                self._insert_voice(entry)
+                self.transcript.insert("end", "\n")
+            else:
+                self.transcript.insert("end", "[unsupported message]\n", (tag,))
         self.transcript.config(state="disabled")
         self.transcript.see("end")
 
-    def _append_chat(self, key, who, text):
-        self.chats.setdefault(key, []).append((who, text))
+    def _insert_image(self, entry):
+        if not HAVE_PIL:
+            self.transcript.insert("end", f"[image: {entry.get('filename', '?')} "
+                                           "- install Pillow to view: pip install pillow]\n")
+            return
+        try:
+            img = Image.open(io.BytesIO(entry["data"]))
+            img.thumbnail((260, 260))
+            photo = ImageTk.PhotoImage(img)
+        except Exception:
+            self.transcript.insert("end", "[could not display image]\n")
+            return
+        self._media_photo_refs.append(photo)  # prevent garbage collection
+        lbl = tk.Label(self.transcript, image=photo, cursor="hand2", bd=1, relief="solid")
+        data, filename = entry["data"], entry.get("filename", "image.jpg")
+        lbl.bind("<Button-1>", lambda e: self._open_image_full(data, filename))
+        self.transcript.window_create("end", window=lbl)
+
+    def _open_image_full(self, data, filename):
+        try:
+            suffix = os.path.splitext(filename)[1] or ".jpg"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.write(data)
+            tmp.close()
+            if _IS_WINDOWS:
+                os.startfile(tmp.name)
+            else:
+                subprocess.run(["xdg-open", tmp.name])
+        except Exception as e:
+            messagebox.showerror("Open failed", str(e))
+
+    def _insert_voice(self, entry):
+        dur = self._voice_duration(entry)
+        playing = self._playing_voice_entry is entry
+        elapsed = time.monotonic() - self._playback_started_at if playing else 0
+        btn = ttk.Button(
+            self.transcript,
+            text=self._voice_button_text(dur, playing, elapsed),
+            command=lambda: self._play_voice(entry, btn),
+            width=31,
+            padding=(8, 5)
+        )
+        if playing:
+            self._active_voice_button = btn
+        self.transcript.window_create("end", window=btn)
+
+    @staticmethod
+    def _voice_duration(entry):
+        try:
+            duration = float(entry.get("duration", 0))
+        except (TypeError, ValueError):
+            return 0.0
+        return duration if math.isfinite(duration) and duration > 0 else 0.0
+
+    @staticmethod
+    def _voice_button_text(duration, playing, elapsed=0):
+        seconds = max(0, int(duration))
+        duration_text = f"{seconds // 60}:{seconds % 60:02d}"
+        if playing:
+            elapsed_seconds = max(0, int(elapsed))
+            return f"⏹  Stop voice  {elapsed_seconds // 60}:{elapsed_seconds % 60:02d} / {duration_text}"
+        return f"▶  Play voice message  ({duration_text})"
+
+    def _play_voice(self, entry, button):
+        if not HAVE_AUDIO:
+            messagebox.showinfo("Playback unavailable",
+                                 "Install sounddevice + numpy to play voice messages:\n"
+                                 "pip install sounddevice numpy")
+            return
+
+        if self._playing_voice_entry is entry:
+            self._stop_voice_playback()
+            return
+        if self._playing_voice_entry is not None:
+            self._stop_voice_playback()
+
+        self._playback_generation += 1
+        generation = self._playback_generation
+        self._playing_voice_entry = entry
+        self._active_voice_button = button
+        self._playback_started_at = time.monotonic()
+        self._update_playback_indicator()
+
+        def worker():
+            error = None
+            try:
+                buf = io.BytesIO(entry["data"])
+                with wave.open(buf, "rb") as wf:
+                    if wf.getsampwidth() != 2 or wf.getcomptype() != "NONE":
+                        raise ValueError("Only uncompressed 16-bit PCM voice messages are supported")
+                    framerate = wf.getframerate()
+                    channels = wf.getnchannels()
+                    raw = wf.readframes(wf.getnframes())
+                if channels < 1 or framerate < 1 or not raw:
+                    raise ValueError("The voice message contains no playable audio")
+                arr = np.frombuffer(raw, dtype=np.int16)
+                if channels > 1:
+                    arr = arr.reshape(-1, channels)
+                sd.play(arr, samplerate=framerate, blocking=True)
+            except Exception as e:
+                error = str(e)
+            finally:
+                self.root.after(0, lambda: self._finish_voice_playback(generation, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_playback_indicator(self):
+        if self._playing_voice_entry is None or self._playback_started_at is None:
+            return
+        duration = self._voice_duration(self._playing_voice_entry)
+        elapsed = time.monotonic() - self._playback_started_at
+        if self._active_voice_button is not None:
+            self._active_voice_button.config(
+                text=self._voice_button_text(duration, True, elapsed)
+            )
+        self._playback_timer_id = self.root.after(250, self._update_playback_indicator)
+
+    def _stop_voice_playback(self):
+        self._playback_generation += 1
+        try:
+            sd.stop()
+        except Exception as e:
+            self.log(f"Could not stop voice playback: {e}")
+        self._clear_playback_state()
+
+    def _finish_voice_playback(self, generation, error=None):
+        if generation != self._playback_generation:
+            return
+        self._clear_playback_state()
+        if error:
+            self.log(f"Voice playback failed: {error}")
+
+    def _clear_playback_state(self):
+        if self._playback_timer_id is not None:
+            self.root.after_cancel(self._playback_timer_id)
+            self._playback_timer_id = None
+        button = self._active_voice_button
+        entry = self._playing_voice_entry
+        self._active_voice_button = None
+        self._playing_voice_entry = None
+        self._playback_started_at = None
+        if button is not None and entry is not None:
+            button.config(text=self._voice_button_text(self._voice_duration(entry), False))
+
+    def _append_chat(self, key, entry):
+        self.chats.setdefault(key, []).append(entry)
         if self.selected_key == key:
             self._render_transcript()
 
@@ -468,14 +824,28 @@ class ChatApp:
 
     def _scan_worker(self, cidr):
         def progress(done, total):
-            self.status_var.set(f"Scanning... {done}/{total}")
+            self.root.after(0, lambda: self.status_var.set(f"Scanning... {done}/{total}"))
 
-        _, local_ip = get_subnet_cidr()
-        devices = scan_network(cidr, local_ip, progress_cb=progress, log_cb=self.log)
-        self.status_var.set("Checking which devices are reachable for messaging...")
-        for d in devices:
-            d["reachable"] = "self" if d["is_self"] else ("yes" if check_listener_running(d["ip"]) else "no")
-        self.root.after(0, lambda: self._apply_scan_results(devices))
+        try:
+            _, local_ip = get_subnet_cidr()
+            devices = scan_network(cidr, local_ip, progress_cb=progress, log_cb=self.log)
+            self.root.after(
+                0, lambda: self.status_var.set("Checking which devices are reachable for messaging...")
+            )
+            for d in devices:
+                d["reachable"] = "self" if d["is_self"] else (
+                    "yes" if check_listener_running(d["ip"]) else "no"
+                )
+            self.root.after(0, lambda: self._apply_scan_results(devices))
+        except Exception as e:
+            self.log(f"Network scan failed: {e}")
+            error = str(e)
+            self.root.after(0, lambda error=error: self._scan_failed(error))
+
+    def _scan_failed(self, error):
+        self.scan_btn.config(state="normal")
+        self.status_var.set("Scan failed")
+        messagebox.showerror("Network scan failed", error)
 
     def _apply_scan_results(self, devices):
         for d in devices:
@@ -507,7 +877,7 @@ class ChatApp:
                     "Scan the network first - no devices are currently marked reachable."
                 )
                 return
-            self._append_chat(GLOBAL_KEY, "You", text)
+            self._append_chat(GLOBAL_KEY, {"who": "You", "kind": "text", "text": text})
             self.msg_entry.delete(0, "end")
             threading.Thread(target=self._broadcast_worker,
                               args=(targets, text, anonymous, display_name), daemon=True).start()
@@ -523,8 +893,8 @@ class ChatApp:
             )
             return
         try:
-            send_message(key, text, anonymous=anonymous, display_name=display_name, scope="private")
-            self._append_chat(key, "You", text)
+            send_text(key, text, anonymous=anonymous, display_name=display_name, scope="private")
+            self._append_chat(key, {"who": "You", "kind": "text", "text": text})
             self.msg_entry.delete(0, "end")
         except Exception as e:
             messagebox.showerror("Send failed", str(e))
@@ -533,18 +903,153 @@ class ChatApp:
         sent, failed = 0, 0
         for ip in targets:
             try:
-                send_message(ip, text, anonymous=anonymous, display_name=display_name, scope="global")
+                send_text(ip, text, anonymous=anonymous, display_name=display_name, scope="global")
                 sent += 1
             except Exception:
                 failed += 1
         self.log(f"Global message sent to {sent} device(s), failed for {failed}.")
 
+    # -- Images / voice -----------------------------------------------------
+
+    def pick_image(self):
+        if not HAVE_PIL:
+            messagebox.showinfo("Pillow required", "Install Pillow to send images:\npip install pillow")
+            return
+        path = filedialog.askopenfilename(
+            title="Choose an image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            data = prepare_image_bytes(path)
+        except Exception as e:
+            messagebox.showerror("Could not prepare image", str(e))
+            return
+        self._send_media("image", data, filename=os.path.basename(path))
+
+    def toggle_recording(self):
+        if not HAVE_AUDIO:
+            messagebox.showinfo("Audio libraries required",
+                                 "Install these to send voice messages:\npip install sounddevice numpy")
+            return
+        if not self.is_recording:
+            try:
+                self.recorder.start()
+            except Exception as e:
+                messagebox.showerror("Could not start recording", str(e))
+                return
+            self.is_recording = True
+            self.recording_started_at = time.monotonic()
+            self.voice_btn.config(text="⏹  Stop recording")
+            self.voice_status_var.set("● REC 00:00")
+            self._update_recording_indicator()
+            self.recording_auto_stop_id = self.root.after(
+                MAX_VOICE_SECONDS * 1000, self._auto_stop_recording
+            )
+        else:
+            self._finish_recording()
+
+    def _update_recording_indicator(self):
+        if not self.is_recording or self.recording_started_at is None:
+            return
+        elapsed = min(int(time.monotonic() - self.recording_started_at), MAX_VOICE_SECONDS)
+        self.voice_status_var.set(f"● REC {elapsed // 60:02d}:{elapsed % 60:02d}")
+        self.recording_timer_id = self.root.after(250, self._update_recording_indicator)
+
+    def _auto_stop_recording(self):
+        if self.is_recording:
+            self.log(f"Recording auto-stopped after {MAX_VOICE_SECONDS}s limit.")
+            self._finish_recording()
+
+    def _finish_recording(self):
+        if not self.is_recording:
+            return
+        self.is_recording = False
+        self._cancel_recording_timers()
+        self.recording_started_at = None
+        self.voice_btn.config(text="🎙  Record voice")
+        self.voice_status_var.set("")
+        try:
+            data, duration = self.recorder.stop()
+        except Exception as e:
+            messagebox.showerror("Could not finish recording", str(e))
+            return
+        if not data or duration < 0.3:
+            self.voice_status_var.set("Recording too short")
+            return
+        self._send_media("voice", data, duration=duration)
+
+    def _cancel_recording_timers(self):
+        for timer_id in (self.recording_timer_id, self.recording_auto_stop_id):
+            if timer_id is not None:
+                self.root.after_cancel(timer_id)
+        self.recording_timer_id = None
+        self.recording_auto_stop_id = None
+
+    def _send_media(self, kind, data, filename=None, duration=None):
+        key = self.selected_key
+        anonymous = self.anon_var.get()
+        display_name = self.name_var.get().strip() or socket.gethostname()
+
+        entry = {"who": "You", "kind": kind, "data": data}
+        if filename is not None:
+            entry["filename"] = filename
+        if duration is not None:
+            entry["duration"] = duration
+
+        if key == GLOBAL_KEY:
+            targets = [ip for ip, c in self.contacts.items() if c["reachable"] == "yes"]
+            if not targets:
+                messagebox.showwarning("No reachable devices",
+                                        "Scan the network first - no devices are currently marked reachable.")
+                return
+            self._append_chat(GLOBAL_KEY, entry)
+            threading.Thread(target=self._broadcast_media_worker,
+                              args=(targets, kind, data, filename, duration, anonymous, display_name),
+                              daemon=True).start()
+            return
+
+        contact = self.contacts.get(key)
+        if not contact or contact["reachable"] != "yes":
+            messagebox.showerror("Not reachable", "This device isn't currently reachable.")
+            return
+        try:
+            if kind == "image":
+                send_image(key, data, filename or "image.jpg", anonymous=anonymous,
+                           display_name=display_name, scope="private")
+            else:
+                send_voice(key, data, duration or 0, anonymous=anonymous,
+                           display_name=display_name, scope="private")
+            self._append_chat(key, entry)
+        except Exception as e:
+            messagebox.showerror("Send failed", str(e))
+
+    def _broadcast_media_worker(self, targets, kind, data, filename, duration, anonymous, display_name):
+        sent, failed = 0, 0
+        for ip in targets:
+            try:
+                if kind == "image":
+                    send_image(ip, data, filename or "image.jpg", anonymous=anonymous,
+                               display_name=display_name, scope="global")
+                else:
+                    send_voice(ip, data, duration or 0, anonymous=anonymous,
+                               display_name=display_name, scope="global")
+                sent += 1
+            except Exception:
+                failed += 1
+        self.log(f"Global {kind} sent to {sent} device(s), failed for {failed}.")
+
     # -- Receiving ----------------------------------------------------------
 
-    def on_message(self, sender_ip, display_name, text, scope):
-        self.root.after(0, lambda: self._handle_incoming(sender_ip, display_name, text, scope))
+    def on_message(self, sender_ip, data):
+        self.root.after(0, lambda: self._handle_incoming(sender_ip, data))
 
-    def _handle_incoming(self, sender_ip, display_name, text, scope):
+    def _handle_incoming(self, sender_ip, data):
+        display_name = data.get("name", "Anonymous")
+        scope = data.get("scope", "private")
+        msgtype = data.get("msgtype", "text")
+
         # Track/refresh the sender as a contact either way, so they appear in
         # the list and can be replied to privately - but WHERE the message
         # itself is shown depends on scope.
@@ -553,13 +1058,32 @@ class ChatApp:
         else:
             self.contacts[sender_ip]["reachable"] = "yes"
 
+        if msgtype == "text":
+            entry = {"who": display_name, "kind": "text", "text": data.get("text", "")}
+        elif msgtype == "image":
+            try:
+                img_bytes = base64.b64decode(data.get("data_b64", ""))
+            except Exception:
+                img_bytes = b""
+            entry = {"who": display_name, "kind": "image", "data": img_bytes,
+                     "filename": data.get("filename", "image.jpg")}
+        elif msgtype == "voice":
+            try:
+                voice_bytes = base64.b64decode(data.get("data_b64", ""))
+            except Exception:
+                voice_bytes = b""
+            entry = {"who": display_name, "kind": "voice", "data": voice_bytes,
+                     "duration": data.get("duration", 0)}
+        else:
+            entry = {"who": display_name, "kind": "text", "text": "[unsupported message type]"}
+
         if scope == "global":
-            self._append_chat(GLOBAL_KEY, display_name, text)
+            self._append_chat(GLOBAL_KEY, entry)
             if self.selected_key != GLOBAL_KEY:
                 self.global_unread = True
                 self.root.bell()
         else:
-            self._append_chat(sender_ip, display_name, text)
+            self._append_chat(sender_ip, entry)
             if self.selected_key != sender_ip:
                 self.contacts[sender_ip]["unread"] = True
                 self.root.bell()
@@ -569,7 +1093,17 @@ class ChatApp:
         self.root.lift()
 
     def _on_close(self):
+        if self.is_recording:
+            self.is_recording = False
+            self._cancel_recording_timers()
+            try:
+                self.recorder.stop()
+            except Exception as e:
+                self.log(f"Could not stop recording during shutdown: {e}")
+        if self._playing_voice_entry is not None:
+            self._stop_voice_playback()
         self.listener.stop()
+        self.listener.join(timeout=1.5)
         self.root.destroy()
 
 

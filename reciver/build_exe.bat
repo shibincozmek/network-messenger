@@ -1,64 +1,101 @@
+
 @echo off
-setlocal
-REM Builds the single unified LAN Chat app into one .exe.
-REM Run this ON WINDOWS, in the same folder as lan_chat.py.
-REM Double-click it, or run it from a Command Prompt.
+setlocal EnableExtensions
+
+title LAN Chat - EXE Builder
 
 echo ============================================
-echo Checking Python is available...
+echo          LAN CHAT EXE BUILDER
 echo ============================================
-where python >nul 2>nul
-if %errorlevel% neq 0 (
-    echo.
-    echo ERROR: "python" was not found on your PATH.
-    echo Try opening a Command Prompt and running "py --version" instead -
-    echo if THAT works, rename every "python" below to "py" and rerun.
-    echo.
+echo.
+
+REM Check Python
+where python >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: Python is not installed or not in PATH.
     pause
     exit /b 1
 )
+
 python --version
 echo.
 
-echo ============================================
-echo Confirming Netchat.py is here...
-echo ============================================
-if not exist Netchat.py (
-    echo ERROR: Netchat.py not found in this folder.
+REM Check source file
+if not exist "lan_chat.py" (
+    echo ERROR: lan_chat.py not found!
+    echo Place this BAT file in the same folder.
     pause
     exit /b 1
 )
-echo OK.
-echo.
 
 echo ============================================
-echo Installing/upgrading PyInstaller...
+echo Installing required libraries...
 echo ============================================
-python -m pip install --upgrade pyinstaller
-if %errorlevel% neq 0 (
-    echo.
-    echo ERROR: pip install failed - see the message above.
-    echo.
-    pause
-    exit /b 1
-)
-echo.
 
-echo ============================================
-echo Building LAN_Chat.exe ...
-echo ============================================
-python -m PyInstaller --onefile --windowed --name LAN_Chat Netchat.py
-if %errorlevel% neq 0 (
-    echo.
-    echo ERROR: Build failed - scroll up for the actual PyInstaller error message.
-    echo.
-    pause
-    exit /b 1
-)
-echo.
+python -m pip install --upgrade pip
+if errorlevel 1 goto ERROR
 
+python -m pip install --upgrade pyinstaller pillow numpy sounddevice cffi
+if errorlevel 1 goto ERROR
+
+echo.
 echo ============================================
-echo SUCCESS. Find it here:
-echo   dist\LAN_Chat.exe
+echo Verifying media libraries...
 echo ============================================
+
+python -c "import PIL; import numpy; import sounddevice; import _sounddevice; print('Pillow OK'); print('NumPy OK'); print('SoundDevice OK')"
+if errorlevel 1 goto ERROR
+
+echo.
+echo ============================================
+echo Cleaning previous builds...
+echo ============================================
+
+if exist build rmdir /s /q build
+if exist dist rmdir /s /q dist
+if exist LAN_Chat.spec del /q LAN_Chat.spec
+
+echo.
+echo ============================================
+echo Building standalone LAN_Chat.exe...
+echo ============================================
+
+python -m PyInstaller ^
+    --clean ^
+    --noconfirm ^
+    --onefile ^
+    --windowed ^
+    --name LAN_Chat ^
+    --collect-all PIL ^
+    --collect-all numpy ^
+    --collect-all sounddevice ^
+    --collect-all cffi ^
+    --collect-binaries sounddevice ^
+    --hidden-import=_sounddevice ^
+    --hidden-import=_cffi_backend ^
+    lan_chat.py
+
+if errorlevel 1 goto ERROR
+
+echo.
+echo ============================================
+echo BUILD SUCCESSFUL!
+echo ============================================
+echo.
+echo Your standalone executable:
+echo dist\LAN_Chat.exe
+echo.
+echo Pillow, NumPy and SoundDevice are bundled.
+echo End users do not need to install Python libraries.
+echo.
 pause
+exit /b 0
+
+:ERROR
+echo.
+echo ============================================
+echo BUILD FAILED!
+echo ============================================
+echo Check the error messages above.
+pause
+exit /b 1
