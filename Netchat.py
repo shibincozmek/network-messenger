@@ -626,7 +626,15 @@ class ChatApp:
             self._render_entry(entry)
             self.transcript.insert("end", "\n")
         self.transcript.config(state="disabled")
-        self.transcript.see("end")
+        self._scroll_to_bottom()
+
+    def _scroll_to_bottom(self):
+        # Messages are embedded widgets whose size is only known after layout, so
+        # scrolling right away lands in the wrong place (the top). Lay out first,
+        # then scroll, and once more shortly after to catch late image sizing.
+        self.transcript.update_idletasks()
+        self.transcript.yview_moveto(1.0)
+        self.root.after(30, lambda: self.transcript.yview_moveto(1.0))
 
     def _render_entry(self, entry):
         who = entry.get("who", "?")
@@ -634,22 +642,23 @@ class ChatApp:
         kind = entry.get("kind", "text")
         tag_color = "#1a5fb4" if who == "You" else "#1a1a1a"
 
-        frame = tk.Frame(self.transcript)
-        tk.Label(frame, text=f"{who}: ", fg="#888", font=("Segoe UI", 10)).pack(side="left", anchor="n")
+        bg = self.transcript.cget("bg")  # same colour as the chat area = no visible box
+        frame = tk.Frame(self.transcript, bg=bg)
+        tk.Label(frame, text=f"{who}: ", fg="#888", bg=bg, font=("Segoe UI", 10)).pack(side="left", anchor="n")
 
         if deleted:
-            tk.Label(frame, text="This message was deleted", fg="#999999",
+            tk.Label(frame, text="This message was deleted", fg="#999999", bg=bg,
                      font=("Segoe UI", 10, "italic")).pack(side="left")
         elif kind == "text":
             suffix = " (edited)" if entry.get("edited") else ""
-            tk.Label(frame, text=entry.get("text", "") + suffix, fg=tag_color,
+            tk.Label(frame, text=entry.get("text", "") + suffix, fg=tag_color, bg=bg,
                      font=("Segoe UI", 10), justify="left", wraplength=520).pack(side="left")
         elif kind == "image":
             self._build_image_widget(frame, entry)
         elif kind == "voice":
             self._build_voice_widget(frame, entry)
         else:
-            tk.Label(frame, text="[unsupported message]", fg=tag_color).pack(side="left")
+            tk.Label(frame, text="[unsupported message]", fg=tag_color, bg=bg).pack(side="left")
 
         if who == "You" and not deleted:
             ellipsis = ttk.Button(frame, text="⋮", width=2,
@@ -726,17 +735,18 @@ class ChatApp:
     def _build_image_widget(self, frame, entry):
         if not HAVE_PIL:
             tk.Label(frame, text=f"[image: {entry.get('filename', '?')} "
-                                 "- install Pillow to view: pip install pillow]").pack(side="left")
+                                 "- install Pillow to view: pip install pillow]",
+                     bg=self.transcript.cget("bg")).pack(side="left")
             return
         try:
             img = Image.open(io.BytesIO(entry["data"]))
             img.thumbnail((260, 260))
             photo = ImageTk.PhotoImage(img)
         except Exception:
-            tk.Label(frame, text="[could not display image]").pack(side="left")
+            tk.Label(frame, text="[could not display image]", bg=self.transcript.cget("bg")).pack(side="left")
             return
         self._media_photo_refs.append(photo)
-        lbl = tk.Label(frame, image=photo, cursor="hand2", bd=1, relief="solid")
+        lbl = tk.Label(frame, image=photo, cursor="hand2", bd=1, relief="solid", bg=self.transcript.cget("bg"))
         data, filename = entry["data"], entry.get("filename", "image.jpg")
         lbl.bind("<Button-1>", lambda e: self._open_image_full(data, filename))
         lbl.pack(side="left")
