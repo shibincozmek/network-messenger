@@ -64,6 +64,11 @@ EDIT_DELETE_WINDOW_SECONDS = 120
 # has many IP addresses) and to show another PC only once.
 DEVICE_ID = uuid.uuid4().hex
 
+EMOJIS = ("😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😎 🤩 🥳 😏 😒 😞 😔 😟 😕 🙁 😣 😢 😭 😤 😠 😡 "
+          "🤯 😳 🥵 🥶 😱 😨 😰 🤔 🤗 🤫 😐 😑 😶 🙄 😴 🤤 😷 🤒 🤕 🤢 🥴 😵 🤠 😈 💀 👻 🤖 💩 "
+          "👍 👎 👌 ✌️ 🤞 🤟 🤘 👏 🙌 🙏 💪 👋 🤝 ✋ 👀 🧠 ❤️ 🧡 💛 💚 💙 💜 🖤 💔 💯 🔥 ✨ ⭐ 🎉 🎁 "
+          "☕ 🍕 🍔 🍟 🍰 🍎 🎵 🎮 📷 💻 📱 ✅ ❌ ⚠️ ❓ ❗").split()
+
 _IS_WINDOWS = platform.system().lower() == "windows"
 _SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0
 
@@ -458,7 +463,7 @@ class ChatApp:
         self.root = root
         root.title("LAN Chat")
         root.geometry("920x640")
-        root.minsize(760, 520)
+        root.minsize(560, 460)
 
         # chats[key] = list of entries; key is a device_id or GLOBAL_KEY
         self.chats = {GLOBAL_KEY: []}
@@ -474,6 +479,8 @@ class ChatApp:
         self.recording_timer_id = None
         self.recording_auto_stop_id = None
         self.voice_status_var = tk.StringVar(value="")
+        self.pending_voice = None   # (wav_bytes, duration) recorded but NOT sent yet
+        self._emoji_win = None
         self._playing_voice_entry = None
         self._active_voice_button = None
         self._playback_started_at = None
@@ -536,30 +543,47 @@ class ChatApp:
         self.transcript = tk.Text(right, wrap="word", state="disabled", font=("Segoe UI", 10))
         self.transcript.pack(fill="both", expand=True, pady=(4, 6))
 
+        # Composer is packed at the BOTTOM first, so when the window is small the
+        # chat area shrinks instead of the buttons being cut off. Two rows:
+        #   row 1: emoji | message box | Send        row 2: options + media buttons
         composer = ttk.Frame(right)
-        composer.pack(fill="x", padx=8, pady=8)
+        composer.pack(side="bottom", fill="x", padx=4, pady=(0, 4), before=self.transcript)
+
+        input_row = ttk.Frame(composer)
+        input_row.pack(fill="x")
+        buttons_row = ttk.Frame(composer)
+        buttons_row.pack(fill="x", pady=(6, 0))
+
+        self.emoji_btn = tk.Button(input_row, text="😊", font=("Segoe UI Emoji", 14), relief="flat",
+                                   cursor="hand2", command=self.toggle_emoji_picker)
+        self.emoji_btn.pack(side="left", padx=(0, 6))
+
+        # Send is packed before the text box so it always keeps its space.
+        self.send_btn = ttk.Button(input_row, text="  ➤ Send  ", command=self.send_current,
+                                   padding=(8, 6))
+        self.send_btn.pack(side="right", padx=(8, 0))
 
         # Enter sends; Shift+Enter inserts a newline.
-        self.msg_entry = tk.Text(composer, height=3, wrap="word", font=("Segoe UI", 10))
-        self.msg_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.msg_entry = tk.Text(input_row, height=3, width=10, wrap="word", font=("Segoe UI", 10))
+        self.msg_entry.pack(side="left", fill="x", expand=True)
         self.msg_entry.bind("<Return>", self._on_composer_return)
         self.msg_entry.bind("<Shift-Return>", lambda e: None)
 
         self.anon_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(composer, text="Anonymous", variable=self.anon_var).pack(side="left", padx=5)
+        ttk.Checkbutton(buttons_row, text="Anonymous", variable=self.anon_var).pack(side="left", padx=(0, 8))
 
-        self.image_btn = ttk.Button(composer, text="📷  Send image", command=self.pick_image,
-                                    width=16, padding=(8, 6))
-        self.image_btn.pack(side="left", padx=(4, 4))
+        self.image_btn = ttk.Button(buttons_row, text="📷  Send image", command=self.pick_image,
+                                    width=16, padding=(8, 4))
+        self.image_btn.pack(side="left", padx=(0, 4))
 
-        self.voice_btn = ttk.Button(composer, text="🎙  Record voice", command=self.toggle_recording,
-                                    width=17, padding=(8, 6))
+        self.voice_btn = ttk.Button(buttons_row, text="🎙  Record voice", command=self.toggle_recording,
+                                    width=17, padding=(8, 4))
         self.voice_btn.pack(side="left", padx=(0, 4))
-        ttk.Label(composer, textvariable=self.voice_status_var, foreground="#c01c28",
+        ttk.Label(buttons_row, textvariable=self.voice_status_var, foreground="#c01c28",
                   font=("Segoe UI", 10, "bold")).pack(side="left", padx=(2, 6))
 
-        self.send_btn = ttk.Button(composer, text="  ➤ Send  ", command=self.send_current)
-        self.send_btn.pack(side="left", padx=(0, 4))
+        # shown only while a recorded voice message is waiting to be sent
+        self.discard_btn = ttk.Button(buttons_row, text="✕ Discard", command=self._discard_pending_voice)
 
         if not HAVE_PIL:
             self.image_btn.config(text="📷  Image unavailable", state="disabled")
@@ -941,6 +965,14 @@ class ChatApp:
     # -- Sending ------------------------------------------------------------
 
     def send_current(self):
+        if self.is_recording:
+            return  # finish (stop) the recording first
+        if self.pending_voice:
+            data, duration = self.pending_voice
+            if self._send_media("voice", data, duration=duration):
+                self._clear_pending_voice()
+            else:
+                return  # couldn't send (nobody online) - keep the recording
         text = self.msg_entry.get("1.0", "end-1c").strip()
         if not text:
             return
@@ -1020,6 +1052,7 @@ class ChatApp:
             except Exception as e:
                 messagebox.showerror("Could not start recording", str(e))
                 return
+            self._clear_pending_voice()
             self.is_recording = True
             self.recording_started_at = time.monotonic()
             self.voice_btn.config(text="⏹  Stop recording")
@@ -1058,7 +1091,52 @@ class ChatApp:
         if not data or duration < 0.3:
             self.voice_status_var.set("Recording too short")
             return
-        self._send_media("voice", data, duration=duration)
+        # Do NOT send yet - keep it until the user presses Send.
+        self.pending_voice = (data, duration)
+        secs = int(duration)
+        self.voice_status_var.set(f"🎙 Voice ready {secs // 60}:{secs % 60:02d} - press Send")
+        self.discard_btn.pack(side="left", padx=(0, 4))
+
+    def _clear_pending_voice(self):
+        self.pending_voice = None
+        self.voice_status_var.set("")
+        self.discard_btn.pack_forget()
+
+    def _discard_pending_voice(self):
+        self._clear_pending_voice()
+
+    # -- Emoji picker -----------------------------------------------------------
+
+    def toggle_emoji_picker(self):
+        if self._emoji_win is not None and self._emoji_win.winfo_exists():
+            self._emoji_win.destroy()
+            self._emoji_win = None
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Emoji")
+        win.resizable(False, False)
+        win.transient(self.root)
+        self._emoji_win = win
+
+        def on_close():
+            self._emoji_win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        win.bind("<Escape>", lambda e: on_close())
+        cols = 8
+        for i, emo in enumerate(EMOJIS):
+            tk.Button(win, text=emo, font=("Segoe UI Emoji", 14), width=2, relief="flat",
+                      cursor="hand2", command=lambda e=emo: self._insert_emoji(e)
+                      ).grid(row=i // cols, column=i % cols, padx=1, pady=1)
+        win.update_idletasks()
+        x = self.emoji_btn.winfo_rootx()
+        y = max(self.emoji_btn.winfo_rooty() - win.winfo_reqheight() - 6, 0)
+        win.geometry(f"+{x}+{y}")
+
+    def _insert_emoji(self, emo):
+        self.msg_entry.insert("insert", emo)
+        self.msg_entry.focus_set()
 
     def _cancel_recording_timers(self):
         for timer_id in (self.recording_timer_id, self.recording_auto_stop_id):
@@ -1083,17 +1161,17 @@ class ChatApp:
             targets = self._targets_for(GLOBAL_KEY)
             if not targets:
                 messagebox.showwarning("No devices online", "No other device running LAN Chat was found yet.")
-                return
+                return False
             self._append_chat(GLOBAL_KEY, entry)
             threading.Thread(target=self._broadcast_media_worker,
                              args=(targets, kind, data, filename, duration, anonymous, display_name, msg_id),
                              daemon=True).start()
-            return
+            return True
 
         contact = self.contacts.get(key)
         if not contact or contact["reachable"] != "yes":
             messagebox.showerror("Not reachable", "This device is offline right now.")
-            return
+            return False
         try:
             if kind == "image":
                 send_image(contact["ip"], data, filename or "image.jpg", anonymous=anonymous,
@@ -1102,8 +1180,10 @@ class ChatApp:
                 send_voice(contact["ip"], data, duration or 0, anonymous=anonymous,
                            display_name=display_name, scope="private", msg_id=msg_id)
             self._append_chat(key, entry)
+            return True
         except Exception as e:
             messagebox.showerror("Send failed", str(e))
+            return False
 
     def _broadcast_media_worker(self, targets, kind, data, filename, duration, anonymous, display_name, msg_id):
         sent, failed = 0, 0
