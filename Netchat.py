@@ -14,7 +14,8 @@ Global chat: a message sent there goes to every online device, and any
 message anyone sends to Global shows up for everyone.
 
 Only run this on a network you own or have permission to use.
-Needs: Python 3 + tkinter. Optional: pillow (images), sounddevice + numpy (voice).
+Needs: Python 3 + tkinter. Optional: pillow (images), sounddevice + numpy (voice),
+opencv-python (video calling).
 """
 
 import socket
@@ -32,6 +33,9 @@ import ipaddress
 import math
 import uuid
 import time
+import struct
+import sys
+import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
@@ -45,12 +49,26 @@ try:
     import numpy as np
     import sounddevice as sd
     HAVE_AUDIO = True
-except ImportError:
+except Exception:  # ImportError, or OSError if the PortAudio library is missing
     HAVE_AUDIO = False
+
+# Catch ANY error (not just ImportError): a broken OpenCV bundle inside the .exe
+# can fail with other exceptions, and we want to show the real reason.
+CV2_ERROR = ""
+CV2_TB = ""
+try:
+    import cv2
+    HAVE_CV2 = True
+except Exception as _e:
+    HAVE_CV2 = False
+    CV2_ERROR = f"{type(_e).__name__}: {_e}"
+    CV2_TB = traceback.format_exc()
 
 APP_PORT = 50505
 DISCOVERY_PORT = 50506
+VIDEO_PORT = 50507
 GLOBAL_KEY = "__global__"
+VIDEO_KEY = "__video__"
 MAX_IMAGE_DIM = 1024
 MAX_VOICE_SECONDS = 30
 DISCOVERY_TIMEOUT = 3.0
@@ -59,6 +77,11 @@ FAST_SCAN_INTERVAL_MS = 6_000     # how often we look for other devices
 CONTACT_EXPIRY_CHECK_MS = 8_000
 CONTACT_OFFLINE_AFTER = 20        # seconds of silence before a contact shows as offline
 EDIT_DELETE_WINDOW_SECONDS = 120
+
+VIDEO_FPS = 8                      # modest frame rate - keeps LAN bandwidth and CPU sane
+VIDEO_MAX_DIM = 320                # longest side of each video frame sent over the wire
+VIDEO_JPEG_QUALITY = 55
+VIDEO_PEER_RECONNECT_MS = 3_000    # how often we retry connecting to in-call peers we're missing
 
 # Unique id of THIS running copy. Used to recognise our own PC (even when it
 # has many IP addresses) and to show another PC only once.
@@ -240,10 +263,11 @@ class MessageListener(threading.Thread):
 class DiscoveryListener(threading.Thread):
     """UDP responder: answers 'who is running LAN Chat?' requests."""
 
-    def __init__(self, on_error=None, port=DISCOVERY_PORT):
+    def __init__(self, on_error=None, port=DISCOVERY_PORT, video_status_cb=None):
         super().__init__(daemon=True)
         self.on_error = on_error
         self.port = port
+        self.video_status_cb = video_status_cb or (lambda: False)
         self._stop_event = threading.Event()
 
     def run(self):
@@ -278,6 +302,7 @@ class DiscoveryListener(threading.Thread):
                         "device_id": DEVICE_ID,
                         "device_name": socket.gethostname(),
                         "tcp_port": APP_PORT,
+                        "in_video_call": bool(self.video_status_cb()),
                     }
                     try:
                         srv.sendto(json.dumps(response).encode("utf-8"), sender)
@@ -381,8 +406,8 @@ def get_local_interfaces():
 def discover_devices(timeout=DISCOVERY_TIMEOUT, log_cb=None):
     """
     Look for other copies of this app on every adapter's subnet.
-    Returns a list of {"device_id", "hostname", "ips": [..]} - one entry per
-    DEVICE (not per IP), never including this PC.
+    Returns a list of {"device_id", "hostname", "ips": [..], "in_video_call": bool} -
+    one entry per DEVICE (not per IP), never including this PC.
     """
     interfaces = get_local_interfaces()
     request = json.dumps({
@@ -438,9 +463,12 @@ def discover_devices(timeout=DISCOVERY_TIMEOUT, log_cb=None):
                     if not isinstance(name, str) or not name.strip() or port != APP_PORT:
                         continue
                     with lock:
-                        d = found.setdefault(did, {"device_id": did, "hostname": name.strip(), "ips": []})
+                        d = found.setdefault(did, {"device_id": did, "hostname": name.strip(), "ips": [],
+                                                    "in_video_call": False})
                         if sender[0] not in d["ips"]:
                             d["ips"].append(sender[0])
+                        if resp.get("in_video_call"):
+                            d["in_video_call"] = True
         except OSError as e:
             if log_cb:
                 log_cb(f"Discovery on {local_ip} failed: {e}")
@@ -452,6 +480,87 @@ def discover_devices(timeout=DISCOVERY_TIMEOUT, log_cb=None):
     for t in threads:
         t.join(timeout + 3)
     return list(found.values())
+
+
+# ----------------------------------------------------------------------
+# Video calling
+# ----------------------------------------------------------------------
+
+def _recv_exact(sock, n):
+    """Read exactly n bytes or raise ConnectionError."""
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("connection closed")
+        buf += chunk
+    return buf
+
+
+def _send_framed(sock, payload_bytes):
+    sock.sendall(struct.pack(">I", len(payload_bytes)) + payload_bytes)
+
+
+class VideoCallListener(threading.Thread):
+    """
+    Always-on TCP server for incoming video streams. Each connecting peer
+    sends one small JSON header ({"device_id","hostname"}) then a continuous
+    stream of length-prefixed JPEG frames. We just keep the latest frame per
+    peer in a shared dict for the call window to read on its own timer.
+    """
+
+    def __init__(self, frames_dict, frames_lock, on_peer_seen, port=VIDEO_PORT):
+        super().__init__(daemon=True)
+        self.frames = frames_dict
+        self.frames_lock = frames_lock
+        self.on_peer_seen = on_peer_seen
+        self.port = port
+        self._stop_event = threading.Event()
+
+    def run(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", self.port))
+        srv.listen(8)
+        srv.settimeout(1.0)
+        while not self._stop_event.is_set():
+            try:
+                conn, addr = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._handle_peer, args=(conn,), daemon=True).start()
+        srv.close()
+
+    def _handle_peer(self, conn):
+        device_id = None
+        try:
+            conn.settimeout(10)
+            header_len = struct.unpack(">I", _recv_exact(conn, 4))[0]
+            header = json.loads(_recv_exact(conn, header_len).decode("utf-8"))
+            device_id = header.get("device_id")
+            hostname = header.get("hostname", "?")
+            if self.on_peer_seen:
+                self.on_peer_seen(device_id, hostname)
+            conn.settimeout(5)
+            while not self._stop_event.is_set():
+                frame_len = struct.unpack(">I", _recv_exact(conn, 4))[0]
+                if frame_len > 5_000_000:  # sanity cap - never trust an unbounded length
+                    break
+                frame = _recv_exact(conn, frame_len)
+                with self.frames_lock:
+                    self.frames[device_id] = frame
+        except Exception:
+            pass
+        finally:
+            conn.close()
+            if device_id is not None:
+                with self.frames_lock:
+                    self.frames.pop(device_id, None)
+
+    def stop(self):
+        self._stop_event.set()
 
 
 # ----------------------------------------------------------------------
@@ -467,7 +576,8 @@ class ChatApp:
 
         # chats[key] = list of entries; key is a device_id or GLOBAL_KEY
         self.chats = {GLOBAL_KEY: []}
-        # contacts[device_id] = {"hostname", "ip", "reachable": "yes"/"no", "unread", "last_seen"}
+        # contacts[device_id] = {"hostname", "ip", "reachable": "yes"/"no", "unread", "last_seen",
+        #                         "in_video_call": bool}
         self.contacts = {}
         self.selected_key = GLOBAL_KEY
         self.global_unread = False
@@ -491,12 +601,30 @@ class ChatApp:
         self._contact_expiry_id = None
         self._scan_running = False
 
+        # -- video calling state --
+        self.in_video_call = False
+        self.video_capture = None
+        self.video_send_thread_stop = threading.Event()
+        self.video_peers_out = {}   # device_id -> socket (outgoing stream to that peer)
+        self.video_peers_lock = threading.Lock()
+        self.video_frames_in = {}   # device_id -> latest JPEG bytes received from them
+        self.video_frames_lock = threading.Lock()
+        self.video_photo_refs = {}  # device_id -> PhotoImage (keeps them alive in the grid)
+        self.video_tiles = {}       # device_id -> tk.Label in the call window
+        self.call_window = None
+        self._video_reconnect_id = None
+        self._video_grid_refresh_id = None
+
         self._build_ui()
 
         self.listener = MessageListener(self.on_message)
         self.listener.start()
-        self.discovery_listener = DiscoveryListener(on_error=self.log)
+        self.discovery_listener = DiscoveryListener(on_error=self.log,
+                                                      video_status_cb=lambda: self.in_video_call)
         self.discovery_listener.start()
+        self.video_listener = VideoCallListener(self.video_frames_in, self.video_frames_lock,
+                                                  on_peer_seen=self._on_video_peer_seen)
+        self.video_listener.start()
 
         self.root.after(200, self._fast_scan_tick)
         self._contact_expiry_id = self.root.after(CONTACT_EXPIRY_CHECK_MS, self._expire_stale_contacts)
@@ -597,10 +725,27 @@ class ChatApp:
 
     # -- Contact list -----------------------------------------------------
 
+    def _video_available_count(self):
+        return sum(1 for c in self.contacts.values()
+                   if c.get("in_video_call") and c.get("reachable") == "yes")
+
+    def _update_video_room_label(self):
+        # Keep the list row's live count in sync, and keep the call window's
+        # tiles in sync with who's currently in the room, even if neither
+        # changed via a click just now.
+        self._refresh_contact_list()
+        if self.call_window is not None and self.call_window.winfo_exists():
+            self._refresh_call_tiles()
+
     def _refresh_contact_list(self):
         self.contact_list.delete(0, "end")
-        self._contact_keys = [GLOBAL_KEY]
+        self._contact_keys = [GLOBAL_KEY, VIDEO_KEY]
         self.contact_list.insert("end", "🌐 Global (everyone)" + (" ●" if self.global_unread else ""))
+        n = self._video_available_count()
+        label = f"📹 Global Video Call ({n} in call)" if n else "📹 Global Video Call (start one)"
+        if self.in_video_call:
+            label = "📹 Global Video Call (you're in it)"
+        self.contact_list.insert("end", label)
 
         for did, c in sorted(self.contacts.items(), key=lambda kv: kv[1]["hostname"].lower()):
             marker = "🟢" if c["reachable"] == "yes" else "⚪"
@@ -626,6 +771,12 @@ class ChatApp:
         if not sel:
             return
         key = self._contact_keys[sel[0]]
+        if key == VIDEO_KEY:
+            # Not a chat thread - clicking it opens the call room, then the
+            # list selection snaps back to whatever chat was actually open.
+            self._open_call_window()
+            self._refresh_contact_list()
+            return
         self.selected_key = key
         if key == GLOBAL_KEY:
             self.global_unread = False
@@ -932,7 +1083,8 @@ class ChatApp:
             existing = self.contacts.get(did)
             if existing is None:
                 self.contacts[did] = {"hostname": d["hostname"], "ip": d["ips"][0], "reachable": "yes",
-                                      "unread": False, "last_seen": time.time()}
+                                      "unread": False, "last_seen": time.time(),
+                                      "in_video_call": d.get("in_video_call", False)}
                 changed = True
                 continue
             if existing["reachable"] != "yes":
@@ -946,9 +1098,13 @@ class ChatApp:
             if existing["hostname"] != d["hostname"]:
                 existing["hostname"] = d["hostname"]
                 changed = True
+            if existing.get("in_video_call", False) != d.get("in_video_call", False):
+                existing["in_video_call"] = d.get("in_video_call", False)
+                changed = True
         if changed:
             self._refresh_contact_list()
         self._update_status()
+        self._update_video_room_label()
 
     def _expire_stale_contacts(self):
         now = time.time()
@@ -956,11 +1112,298 @@ class ChatApp:
         for c in self.contacts.values():
             if c["reachable"] == "yes" and now - c.get("last_seen", 0) > CONTACT_OFFLINE_AFTER:
                 c["reachable"] = "no"
+                c["in_video_call"] = False
                 changed = True
         if changed:
             self._refresh_contact_list()
             self._update_status()
+            self._update_video_room_label()
         self._contact_expiry_id = self.root.after(CONTACT_EXPIRY_CHECK_MS, self._expire_stale_contacts)
+
+    # -- Video calling --------------------------------------------------------
+    #
+    # Design, kept deliberately simple for a LAN demo rather than a real
+    # conferencing product:
+    #   - "in_video_call" is just a boolean every device announces about
+    #     itself in its existing discovery heartbeat (piggybacking on the
+    #     heartbeat that already drives online/offline for chat), so the
+    #     room's participant count updates the same way the contact list does.
+    #   - Everyone who's "in the room" connects directly to everyone else
+    #     who's in the room (a full mesh) - fine for a handful of devices on
+    #     one LAN, not meant to scale to a large call.
+    #   - Each frame is sent as a plain JPEG over its own persistent TCP
+    #     connection per peer, length-prefixed. No audio over this channel -
+    #     this is video-only, to keep the scope manageable.
+
+    def _on_video_peer_seen(self, device_id, hostname):
+        # Called from the listener thread the moment a peer's stream connects,
+        # so their tile can appear even before the next discovery tick.
+        def apply():
+            if self.call_window is not None and self.call_window.winfo_exists():
+                self._ensure_call_tile(device_id, hostname)
+        self.root.after(0, apply)
+
+    def _open_call_window(self):
+        if self.call_window is not None and self.call_window.winfo_exists():
+            self.call_window.lift()
+            self.call_window.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Global Video Call")
+        win.geometry("700x500")
+        win.protocol("WM_DELETE_WINDOW", self._close_call_window)
+        self.call_window = win
+
+        top = ttk.Frame(win, padding=8)
+        top.pack(fill="x")
+        self.call_status_var = tk.StringVar(value="Not in the call yet.")
+        ttk.Label(top, textvariable=self.call_status_var).pack(side="left")
+        self.join_btn = ttk.Button(top, text="📹 Join Call", command=self._join_video_call)
+        self.join_btn.pack(side="right")
+        self.leave_btn = ttk.Button(top, text="🚪 Leave Call", command=self._leave_video_call)
+        if not HAVE_CV2 or not HAVE_PIL:
+            self.join_btn.config(state="disabled")
+            missing = [n for n, ok in (("opencv-python", HAVE_CV2), ("pillow", HAVE_PIL)) if not ok]
+            msg = "Video call unavailable - " + " and ".join(missing) + " could not be loaded."
+            if CV2_ERROR:
+                msg += f"\nReason: {CV2_ERROR}"
+            if getattr(sys, "frozen", False):
+                msg += "\n(Rebuild the .exe with the latest build_exe.bat.)"
+            else:
+                msg += "\n(pip install opencv-python pillow)"
+            self.call_status_var.set(msg)
+            self.log(msg.replace("\n", " "))
+            if CV2_TB:
+                self.log(CV2_TB)
+
+        self.call_grid = ttk.Frame(win, padding=8)
+        self.call_grid.pack(fill="both", expand=True)
+        self.video_tiles = {}
+
+        self._refresh_call_tiles()
+        self._video_grid_refresh_id = self.root.after(1000 // VIDEO_FPS, self._video_grid_tick)
+
+    def _close_call_window(self):
+        if self.in_video_call:
+            self._leave_video_call()
+        if self._video_grid_refresh_id is not None:
+            self.root.after_cancel(self._video_grid_refresh_id)
+            self._video_grid_refresh_id = None
+        if self.call_window is not None:
+            self.call_window.destroy()
+        self.call_window = None
+
+    def _ensure_call_tile(self, device_id, hostname):
+        if device_id in self.video_tiles or self.call_window is None or not self.call_window.winfo_exists():
+            return
+        cell = tk.Frame(self.call_grid, bg="#1e1e1e", width=260, height=200)
+        cell.pack_propagate(False)
+        img_label = tk.Label(cell, bg="#1e1e1e", text="(connecting...)", fg="#aaa")
+        img_label.pack(fill="both", expand=True)
+        name_label = tk.Label(cell, text=hostname, bg="#333", fg="white", font=("Segoe UI", 9))
+        name_label.pack(fill="x", side="bottom")
+        self.video_tiles[device_id] = {"cell": cell, "img": img_label, "name": name_label}
+        self._relayout_call_grid()
+
+    def _remove_call_tile(self, device_id):
+        tile = self.video_tiles.pop(device_id, None)
+        if tile:
+            tile["cell"].destroy()
+            self.video_photo_refs.pop(device_id, None)
+            self._relayout_call_grid()
+
+    def _relayout_call_grid(self):
+        keys = list(self.video_tiles.keys())
+        cols = max(1, int(math.ceil(math.sqrt(max(len(keys), 1)))))
+        for i, did in enumerate(keys):
+            r, c = divmod(i, cols)
+            self.video_tiles[did]["cell"].grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
+        for i in range(cols):
+            self.call_grid.grid_columnconfigure(i, weight=1)
+
+    def _refresh_call_tiles(self):
+        """Make the grid match who's currently marked in_video_call."""
+        if self.call_window is None or not self.call_window.winfo_exists():
+            return
+        wanted = {did for did, c in self.contacts.items()
+                  if c.get("in_video_call") and c.get("reachable") == "yes"}
+        for did in list(self.video_tiles.keys()):
+            if did not in wanted:
+                self._remove_call_tile(did)
+        for did in wanted:
+            self._ensure_call_tile(did, self.contacts[did]["hostname"])
+
+    def _video_grid_tick(self):
+        """Repaint each tile from the latest frame bytes the listener captured."""
+        if self.call_window is not None and self.call_window.winfo_exists():
+            with self.video_frames_lock:
+                snapshot = dict(self.video_frames_in)
+            for did, jpeg_bytes in snapshot.items():
+                tile = self.video_tiles.get(did)
+                if tile is None:
+                    continue
+                photo = self._jpeg_bytes_to_photo(jpeg_bytes)
+                if photo is not None:
+                    self.video_photo_refs[did] = photo  # keep alive
+                    tile["img"].config(image=photo, text="")
+            self._video_grid_refresh_id = self.root.after(1000 // VIDEO_FPS, self._video_grid_tick)
+        else:
+            self._video_grid_refresh_id = None
+
+    @staticmethod
+    def _jpeg_bytes_to_photo(jpeg_bytes):
+        if HAVE_PIL:
+            try:
+                img = Image.open(io.BytesIO(jpeg_bytes))
+                return ImageTk.PhotoImage(img)
+            except Exception:
+                return None
+        if HAVE_CV2:
+            try:
+                arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is None:
+                    return None
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                return ImageTk.PhotoImage(image=Image.fromarray(frame)) if HAVE_PIL else None
+            except Exception:
+                return None
+        return None
+
+    def _join_video_call(self):
+        if not HAVE_CV2 or not HAVE_PIL:
+            missing = []
+            if not HAVE_CV2:
+                missing.append("opencv-python")
+            if not HAVE_PIL:
+                missing.append("pillow")
+            messagebox.showinfo("Libraries required",
+                                "Video calling needs both of these (camera capture needs OpenCV, "
+                                "displaying the video needs Pillow):\n"
+                                f"pip install {' '.join(missing)}")
+            return
+        if self.in_video_call:
+            return
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            messagebox.showerror("Camera unavailable", "Could not open a webcam (device 0).")
+            cap.release()
+            return
+        self.video_capture = cap
+        self.in_video_call = True
+        self.video_send_thread_stop.clear()
+        self.join_btn.pack_forget()
+        self.leave_btn.pack(side="right")
+        self.call_status_var.set("In the call - streaming your camera.")
+        self._ensure_call_tile(DEVICE_ID, self.name_var.get().strip() or "You")
+
+        threading.Thread(target=self._video_send_loop, daemon=True).start()
+        self._video_reconnect_id = self.root.after(VIDEO_PEER_RECONNECT_MS, self._reconcile_video_peers_tick)
+        self._update_video_room_label()  # our own heartbeat will also announce this within FAST_SCAN_INTERVAL_MS
+
+    def _leave_video_call(self):
+        if not self.in_video_call:
+            return
+        self.in_video_call = False
+        self.video_send_thread_stop.set()
+        if self.video_capture is not None:
+            try:
+                self.video_capture.release()
+            except Exception:
+                pass
+            self.video_capture = None
+        with self.video_peers_lock:
+            for sock in self.video_peers_out.values():
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            self.video_peers_out.clear()
+        self._remove_call_tile(DEVICE_ID)
+        if self._video_reconnect_id is not None:
+            self.root.after_cancel(self._video_reconnect_id)
+            self._video_reconnect_id = None
+        if self.call_window is not None and self.call_window.winfo_exists():
+            self.leave_btn.pack_forget()
+            self.join_btn.pack(side="right")
+            self.call_status_var.set("Left the call.")
+        self._update_video_room_label()
+
+    def _reconcile_video_peers_tick(self):
+        if self.in_video_call:
+            threading.Thread(target=self._reconcile_video_peers, daemon=True).start()
+            self._video_reconnect_id = self.root.after(VIDEO_PEER_RECONNECT_MS,
+                                                        self._reconcile_video_peers_tick)
+        else:
+            self._video_reconnect_id = None
+
+    def _reconcile_video_peers(self):
+        """Open outgoing connections to any in-call peer we're not yet streaming to."""
+        wanted = {did: c["ip"] for did, c in self.contacts.items()
+                 if c.get("in_video_call") and c.get("reachable") == "yes"}
+        with self.video_peers_lock:
+            existing = set(self.video_peers_out.keys())
+        for did, ip in wanted.items():
+            if did in existing:
+                continue
+            try:
+                sock = socket.create_connection((ip, VIDEO_PORT), timeout=5)
+                header = json.dumps({"device_id": DEVICE_ID,
+                                     "hostname": self.name_var.get().strip() or socket.gethostname()}
+                                    ).encode("utf-8")
+                _send_framed(sock, header)
+                with self.video_peers_lock:
+                    self.video_peers_out[did] = sock
+            except Exception:
+                pass
+        # Drop connections to peers no longer in the call.
+        with self.video_peers_lock:
+            for did in list(self.video_peers_out.keys()):
+                if did not in wanted:
+                    try:
+                        self.video_peers_out[did].close()
+                    except Exception:
+                        pass
+                    del self.video_peers_out[did]
+
+    def _video_send_loop(self):
+        # Kick off an immediate peer connect so we don't wait a full
+        # VIDEO_PEER_RECONNECT_MS before the first frame can go anywhere.
+        self._reconcile_video_peers()
+        frame_interval = 1.0 / VIDEO_FPS
+        while not self.video_send_thread_stop.is_set():
+            start = time.monotonic()
+            ok, frame = self.video_capture.read()
+            if not ok:
+                time.sleep(frame_interval)
+                continue
+            h, w = frame.shape[:2]
+            scale = VIDEO_MAX_DIM / max(h, w)
+            if scale < 1:
+                frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, VIDEO_JPEG_QUALITY])
+            if not ok:
+                continue
+            jpeg_bytes = buf.tobytes()
+            with self.video_frames_lock:
+                self.video_frames_in[DEVICE_ID] = jpeg_bytes  # so our own tile shows our own feed too
+
+            with self.video_peers_lock:
+                peers = dict(self.video_peers_out)
+            for did, sock in peers.items():
+                try:
+                    _send_framed(sock, jpeg_bytes)
+                except Exception:
+                    with self.video_peers_lock:
+                        self.video_peers_out.pop(did, None)
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+
+            elapsed = time.monotonic() - start
+            time.sleep(max(0.0, frame_interval - elapsed))
 
     # -- Sending ------------------------------------------------------------
 
@@ -1246,7 +1689,7 @@ class ChatApp:
         c = self.contacts.get(did)
         if c is None:
             self.contacts[did] = {"hostname": host, "ip": sender_ip, "reachable": "yes",
-                                  "unread": False, "last_seen": time.time()}
+                                  "unread": False, "last_seen": time.time(), "in_video_call": False}
         else:
             c["reachable"] = "yes"
             c["last_seen"] = time.time()
@@ -1302,6 +1745,11 @@ class ChatApp:
                 self.log(f"Could not stop recording during shutdown: {e}")
         if self._playing_voice_entry is not None:
             self._stop_voice_playback()
+        if self.in_video_call:
+            self._leave_video_call()
+        if self._video_grid_refresh_id is not None:
+            self.root.after_cancel(self._video_grid_refresh_id)
+            self._video_grid_refresh_id = None
         for timer_id in (self._contact_expiry_id, self._fast_scan_id):
             if timer_id is not None:
                 self.root.after_cancel(timer_id)
@@ -1309,10 +1757,31 @@ class ChatApp:
         self.listener.join(timeout=1.5)
         self.discovery_listener.stop()
         self.discovery_listener.join(timeout=1.5)
+        self.video_listener.stop()
+        self.video_listener.join(timeout=1.5)
         self.root.destroy()
 
 
+def _selftest():
+    """`LAN_Chat.exe --selftest` writes selftest.txt next to the exe, then exits.
+    build_exe.bat uses it to check that OpenCV really made it into the exe."""
+    lines = [
+        f"python={sys.version.split()[0]} frozen={getattr(sys, 'frozen', False)}",
+        "cv2=" + (f"OK {cv2.__version__}" if HAVE_CV2 else f"FAIL {CV2_ERROR}"),
+        "pillow=" + ("OK" if HAVE_PIL else "FAIL"),
+        "audio=" + ("OK" if HAVE_AUDIO else "FAIL"),
+    ]
+    if CV2_TB:
+        lines.append(CV2_TB)
+    base = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    with open(os.path.join(base, "selftest.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def main():
+    if "--selftest" in sys.argv:
+        _selftest()
+        return
     root = tk.Tk()
     ChatApp(root)
     root.mainloop()
