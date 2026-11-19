@@ -1,0 +1,4 @@
+python=3.14.2 frozen=True
+cv2=OK 5.1.0
+pillow=OK
+audio=OK

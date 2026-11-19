@@ -72,23 +72,25 @@ echo.
 
 echo ============================================
 echo Checking required packages...
+echo (pillow, numpy, sounddevice, opencv-python for video calling)
 echo ============================================
 "%PY%" -m pip --version >nul 2>nul
 if %errorlevel% neq 0 "%PY%" -m ensurepip --upgrade >nul 2>nul
 
-"%PY%" -c "import PyInstaller, PIL, numpy, sounddevice" >nul 2>nul
+"%PY%" -c "import PyInstaller, PIL, numpy, sounddevice, cv2" >nul 2>nul
 if %errorlevel% equ 0 (
     echo All packages already installed.
     goto build
 )
 if "%ONLINE%"=="0" (
     echo ERROR: some packages are missing and there is no internet to download them.
-    echo Needed: pyinstaller pillow numpy sounddevice
+    echo Needed: pyinstaller pillow numpy sounddevice opencv-python
     pause
     exit /b 1
 )
-echo Installing pyinstaller, pillow, numpy, sounddevice...
-"%PY%" -m pip install --upgrade pyinstaller pillow numpy sounddevice
+echo Installing pyinstaller, pillow, numpy, sounddevice, opencv-python...
+echo (opencv-python is a big download - this step can take a while, that's normal)
+"%PY%" -m pip install --upgrade pyinstaller pillow numpy sounddevice opencv-python
 if %errorlevel% neq 0 (
     echo ERROR: pip install failed - see the message above.
     pause
@@ -99,14 +101,28 @@ if %errorlevel% neq 0 (
 echo.
 echo ============================================
 echo Building LAN_Chat.exe ...
+echo (also slower than before because of opencv-python - that's expected)
 echo ============================================
-"%PY%" -m PyInstaller --onefile --windowed --name LAN_Chat "%SRC%"
+"%PY%" -m PyInstaller --onefile --windowed --name LAN_Chat --collect-all cv2 --collect-all sounddevice "%SRC%"
 if %errorlevel% neq 0 (
     echo ERROR: Build failed - scroll up for the PyInstaller error.
     pause
     exit /b 1
 )
 echo.
+
+echo ============================================
+echo Verifying the build actually has cv2/Pillow/audio bundled...
+echo ============================================
+del /q "%~dp0selftest.txt" >nul 2>nul
+dist\LAN_Chat.exe --selftest
+if exist "%~dp0selftest.txt" (
+    type "%~dp0selftest.txt"
+) else (
+    echo (selftest.txt was not created - the .exe may not support --selftest yet)
+)
+echo.
+
 echo ============================================
 echo SUCCESS. Find it here:
 echo   dist\LAN_Chat.exe

@@ -13,8 +13,11 @@ own PC is never listed.
 Global chat: a message sent there goes to every online device, and any
 message anyone sends to Global shows up for everyone.
 
+Global video call: Meet/Zoom style room with camera + microphone, mute and
+camera on/off buttons. Joining puts you in the room and shows your own video.
+
 Only run this on a network you own or have permission to use.
-Needs: Python 3 + tkinter. Optional: pillow (images), sounddevice + numpy (voice),
+Needs: Python 3 + tkinter. Optional: pillow (images), sounddevice + numpy (voice + call audio),
 opencv-python (video calling).
 """
 
@@ -35,6 +38,7 @@ import uuid
 import time
 import struct
 import sys
+import queue
 import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
@@ -82,6 +86,9 @@ VIDEO_FPS = 8                      # modest frame rate - keeps LAN bandwidth and
 VIDEO_MAX_DIM = 320                # longest side of each video frame sent over the wire
 VIDEO_JPEG_QUALITY = 55
 VIDEO_PEER_RECONNECT_MS = 3_000    # how often we retry connecting to in-call peers we're missing
+
+AUDIO_RATE = 16000                 # call audio: 16 kHz mono 16-bit
+AUDIO_BLOCK = 640                  # 40 ms of audio per packet
 
 # Unique id of THIS running copy. Used to recognise our own PC (even when it
 # has many IP addresses) and to show another PC only once.
@@ -503,17 +510,22 @@ def _send_framed(sock, payload_bytes):
 
 class VideoCallListener(threading.Thread):
     """
-    Always-on TCP server for incoming video streams. Each connecting peer
-    sends one small JSON header ({"device_id","hostname"}) then a continuous
-    stream of length-prefixed JPEG frames. We just keep the latest frame per
-    peer in a shared dict for the call window to read on its own timer.
+    Always-on TCP server for incoming call streams. Each connecting peer sends
+    one small JSON header ({"device_id","hostname"}) then a continuous stream
+    of length-prefixed packets. The first byte of each packet is its type:
+        b"V" = video (JPEG bytes; EMPTY body means the camera is off)
+        b"A" = audio (16-bit mono PCM)
+        b"K" = keepalive
+    We keep the latest video frame per peer in a shared dict, and hand audio
+    to the on_audio callback.
     """
 
-    def __init__(self, frames_dict, frames_lock, on_peer_seen, port=VIDEO_PORT):
+    def __init__(self, frames_dict, frames_lock, on_peer_seen, on_audio=None, port=VIDEO_PORT):
         super().__init__(daemon=True)
         self.frames = frames_dict
         self.frames_lock = frames_lock
         self.on_peer_seen = on_peer_seen
+        self.on_audio = on_audio
         self.port = port
         self._stop_event = threading.Event()
 
@@ -543,14 +555,19 @@ class VideoCallListener(threading.Thread):
             hostname = header.get("hostname", "?")
             if self.on_peer_seen:
                 self.on_peer_seen(device_id, hostname)
-            conn.settimeout(5)
+            conn.settimeout(15)  # the sender sends a keepalive every second
             while not self._stop_event.is_set():
                 frame_len = struct.unpack(">I", _recv_exact(conn, 4))[0]
-                if frame_len > 5_000_000:  # sanity cap - never trust an unbounded length
+                if frame_len < 1 or frame_len > 5_000_000:  # sanity cap
                     break
-                frame = _recv_exact(conn, frame_len)
-                with self.frames_lock:
-                    self.frames[device_id] = frame
+                packet = _recv_exact(conn, frame_len)
+                kind, body = packet[:1], packet[1:]
+                if kind == b"V":
+                    with self.frames_lock:
+                        self.frames[device_id] = body
+                elif kind == b"A" and self.on_audio:
+                    self.on_audio(device_id, body)
+                # b"K" = keepalive, nothing to do
         except Exception:
             pass
         finally:
@@ -605,15 +622,28 @@ class ChatApp:
         self.in_video_call = False
         self.video_capture = None
         self.video_send_thread_stop = threading.Event()
+        self.video_send_thread = None
         self.video_peers_out = {}   # device_id -> socket (outgoing stream to that peer)
         self.video_peers_lock = threading.Lock()
+        self.video_send_lock = threading.Lock()   # one writer at a time on the sockets
         self.video_frames_in = {}   # device_id -> latest JPEG bytes received from them
         self.video_frames_lock = threading.Lock()
         self.video_photo_refs = {}  # device_id -> PhotoImage (keeps them alive in the grid)
-        self.video_tiles = {}       # device_id -> tk.Label in the call window
+        self.video_tiles = {}       # device_id -> dict of widgets in the call window
         self.call_window = None
         self._video_reconnect_id = None
         self._video_grid_refresh_id = None
+
+        # -- call audio / mic / camera state --
+        self.mic_on = True
+        self.camera_on = True
+        self.mic_stream = None
+        self.out_stream = None
+        self.audio_q = queue.Queue(maxsize=50)   # mic chunks waiting to be sent
+        self.audio_bufs = {}                      # device_id -> bytearray of PCM to play
+        self.audio_lock = threading.Lock()
+        self.mic_btn = None
+        self.cam_btn = None
 
         self._build_ui()
 
@@ -623,7 +653,8 @@ class ChatApp:
                                                       video_status_cb=lambda: self.in_video_call)
         self.discovery_listener.start()
         self.video_listener = VideoCallListener(self.video_frames_in, self.video_frames_lock,
-                                                  on_peer_seen=self._on_video_peer_seen)
+                                                  on_peer_seen=self._on_video_peer_seen,
+                                                  on_audio=self._on_audio_in)
         self.video_listener.start()
 
         self.root.after(200, self._fast_scan_tick)
@@ -1131,14 +1162,16 @@ class ChatApp:
     #   - Everyone who's "in the room" connects directly to everyone else
     #     who's in the room (a full mesh) - fine for a handful of devices on
     #     one LAN, not meant to scale to a large call.
-    #   - Each frame is sent as a plain JPEG over its own persistent TCP
-    #     connection per peer, length-prefixed. No audio over this channel -
-    #     this is video-only, to keep the scope manageable.
+    #   - Video (JPEG frames), audio (PCM chunks) and keepalives all go over
+    #     one persistent TCP connection per peer, as length-prefixed packets
+    #     whose first byte is the type (V / A / K).
 
     def _on_video_peer_seen(self, device_id, hostname):
         # Called from the listener thread the moment a peer's stream connects,
         # so their tile can appear even before the next discovery tick.
         def apply():
+            if device_id in self.contacts:
+                self.contacts[device_id]["in_video_call"] = True  # so we connect back right away
             if self.call_window is not None and self.call_window.winfo_exists():
                 self._ensure_call_tile(device_id, hostname)
         self.root.after(0, apply)
@@ -1151,7 +1184,7 @@ class ChatApp:
 
         win = tk.Toplevel(self.root)
         win.title("Global Video Call")
-        win.geometry("700x500")
+        win.geometry("720x580")
         win.protocol("WM_DELETE_WINDOW", self._close_call_window)
         self.call_window = win
 
@@ -1162,6 +1195,8 @@ class ChatApp:
         self.join_btn = ttk.Button(top, text="📹 Join Call", command=self._join_video_call)
         self.join_btn.pack(side="right")
         self.leave_btn = ttk.Button(top, text="🚪 Leave Call", command=self._leave_video_call)
+        self.mic_btn = ttk.Button(top, text="🎙 Mute", command=self._toggle_mic)
+        self.cam_btn = ttk.Button(top, text="📷 Camera off", command=self._toggle_camera)
         if not HAVE_CV2 or not HAVE_PIL:
             self.join_btn.config(state="disabled")
             missing = [n for n, ok in (("opencv-python", HAVE_CV2), ("pillow", HAVE_PIL)) if not ok]
@@ -1181,6 +1216,17 @@ class ChatApp:
         self.call_grid.pack(fill="both", expand=True)
         self.video_tiles = {}
 
+        # If we're still in a call from an earlier window, restore the buttons.
+        if self.in_video_call:
+            self.join_btn.pack_forget()
+            self.leave_btn.pack(side="right")
+            self.cam_btn.pack(side="right", padx=4)
+            self.mic_btn.pack(side="right")
+            if not HAVE_AUDIO:
+                self.mic_btn.config(state="disabled")
+            self._update_call_buttons()
+            self.call_status_var.set("You're in the call.")
+
         self._refresh_call_tiles()
         self._video_grid_refresh_id = self.root.after(1000 // VIDEO_FPS, self._video_grid_tick)
 
@@ -1193,11 +1239,14 @@ class ChatApp:
         if self.call_window is not None:
             self.call_window.destroy()
         self.call_window = None
+        self.mic_btn = None
+        self.cam_btn = None
 
     def _ensure_call_tile(self, device_id, hostname):
         if device_id in self.video_tiles or self.call_window is None or not self.call_window.winfo_exists():
             return
-        cell = tk.Frame(self.call_grid, bg="#1e1e1e", width=260, height=200)
+        # Tile is a bit bigger than the 320px frames so nothing gets cropped.
+        cell = tk.Frame(self.call_grid, bg="#1e1e1e", width=330, height=260)
         cell.pack_propagate(False)
         img_label = tk.Label(cell, bg="#1e1e1e", text="(connecting...)", fg="#aaa")
         img_label.pack(fill="both", expand=True)
@@ -1223,16 +1272,24 @@ class ChatApp:
             self.call_grid.grid_columnconfigure(i, weight=1)
 
     def _refresh_call_tiles(self):
-        """Make the grid match who's currently marked in_video_call."""
+        """Make the grid match who's in the room (including YOU)."""
         if self.call_window is None or not self.call_window.winfo_exists():
             return
         wanted = {did for did, c in self.contacts.items()
                   if c.get("in_video_call") and c.get("reachable") == "yes"}
+        if self.in_video_call:
+            wanted.add(DEVICE_ID)  # your own PC is never in self.contacts - always show yourself
+        with self.video_frames_lock:
+            wanted |= set(self.video_frames_in.keys())  # anyone actually streaming to us
         for did in list(self.video_tiles.keys()):
             if did not in wanted:
                 self._remove_call_tile(did)
         for did in wanted:
-            self._ensure_call_tile(did, self.contacts[did]["hostname"])
+            if did == DEVICE_ID:
+                name = (self.name_var.get().strip() or "You") + " (You)"
+            else:
+                name = self.contacts.get(did, {}).get("hostname", "Participant")
+            self._ensure_call_tile(did, name)
 
     def _video_grid_tick(self):
         """Repaint each tile from the latest frame bytes the listener captured."""
@@ -1242,6 +1299,10 @@ class ChatApp:
             for did, jpeg_bytes in snapshot.items():
                 tile = self.video_tiles.get(did)
                 if tile is None:
+                    continue
+                if not jpeg_bytes:  # empty frame = that person turned their camera off
+                    self.video_photo_refs.pop(did, None)
+                    tile["img"].config(image="", text="📷 Camera off")
                     continue
                 photo = self._jpeg_bytes_to_photo(jpeg_bytes)
                 if photo is not None:
@@ -1291,22 +1352,39 @@ class ChatApp:
             cap.release()
             return
         self.video_capture = cap
+        self.camera_on = True
+        self.mic_on = HAVE_AUDIO
         self.in_video_call = True
         self.video_send_thread_stop.clear()
         self.join_btn.pack_forget()
         self.leave_btn.pack(side="right")
-        self.call_status_var.set("In the call - streaming your camera.")
-        self._ensure_call_tile(DEVICE_ID, self.name_var.get().strip() or "You")
+        self.cam_btn.pack(side="right", padx=4)
+        self.mic_btn.pack(side="right")
+        if not HAVE_AUDIO:
+            self.mic_btn.config(state="disabled")
+        self._update_call_buttons()
+        self.call_status_var.set("You're in the call.")
+        self._ensure_call_tile(DEVICE_ID, (self.name_var.get().strip() or "You") + " (You)")
 
-        threading.Thread(target=self._video_send_loop, daemon=True).start()
+        self._start_audio()
+        self.video_send_thread = threading.Thread(target=self._video_send_loop, daemon=True)
+        self.video_send_thread.start()
+        threading.Thread(target=self._audio_send_loop, daemon=True).start()
         self._video_reconnect_id = self.root.after(VIDEO_PEER_RECONNECT_MS, self._reconcile_video_peers_tick)
-        self._update_video_room_label()  # our own heartbeat will also announce this within FAST_SCAN_INTERVAL_MS
+        if not self._scan_running:  # look for the others right now instead of waiting for the next scan
+            threading.Thread(target=self._scan_worker, daemon=True).start()
+        self._update_video_room_label()
 
     def _leave_video_call(self):
         if not self.in_video_call:
             return
         self.in_video_call = False
         self.video_send_thread_stop.set()
+        self._stop_audio()
+        t = self.video_send_thread
+        if t is not None:
+            t.join(timeout=1.5)
+        self.video_send_thread = None
         if self.video_capture is not None:
             try:
                 self.video_capture.release()
@@ -1320,15 +1398,130 @@ class ChatApp:
                 except Exception:
                     pass
             self.video_peers_out.clear()
+        with self.video_frames_lock:
+            self.video_frames_in.pop(DEVICE_ID, None)
         self._remove_call_tile(DEVICE_ID)
         if self._video_reconnect_id is not None:
             self.root.after_cancel(self._video_reconnect_id)
             self._video_reconnect_id = None
         if self.call_window is not None and self.call_window.winfo_exists():
             self.leave_btn.pack_forget()
+            self.cam_btn.pack_forget()
+            self.mic_btn.pack_forget()
             self.join_btn.pack(side="right")
             self.call_status_var.set("Left the call.")
         self._update_video_room_label()
+
+    # ---- mic / camera buttons ----
+
+    def _toggle_mic(self):
+        self.mic_on = not self.mic_on
+        self._update_call_buttons()
+
+    def _toggle_camera(self):
+        self.camera_on = not self.camera_on
+        self._update_call_buttons()
+
+    def _update_call_buttons(self):
+        if self.mic_btn is None or self.cam_btn is None:
+            return
+        try:
+            self.mic_btn.config(text="🎙 Mute" if self.mic_on else "🔇 Unmute")
+            self.cam_btn.config(text="📷 Camera off" if self.camera_on else "📷 Camera on")
+        except tk.TclError:
+            pass
+
+    # ---- call audio ----
+
+    def _start_audio(self):
+        if not HAVE_AUDIO:
+            self.log("Audio libraries missing - the call will be video only.")
+            return
+        with self.audio_lock:
+            self.audio_bufs.clear()
+        while not self.audio_q.empty():
+            try:
+                self.audio_q.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self.mic_stream = sd.InputStream(samplerate=AUDIO_RATE, channels=1, dtype="int16",
+                                             blocksize=AUDIO_BLOCK, callback=self._mic_callback)
+            self.out_stream = sd.OutputStream(samplerate=AUDIO_RATE, channels=1, dtype="int16",
+                                              blocksize=AUDIO_BLOCK, callback=self._audio_out_callback)
+            self.mic_stream.start()
+            self.out_stream.start()
+        except Exception as e:
+            self.log(f"Could not start call audio: {e}")
+
+    def _stop_audio(self):
+        for name in ("mic_stream", "out_stream"):
+            stream = getattr(self, name)
+            setattr(self, name, None)
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
+
+    def _mic_callback(self, indata, frames, time_info, status):
+        if self.mic_on:
+            try:
+                self.audio_q.put_nowait(indata.tobytes())
+            except queue.Full:
+                pass
+
+    def _audio_send_loop(self):
+        while not self.video_send_thread_stop.is_set():
+            try:
+                data = self.audio_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            self._broadcast_frame(b"A", data)
+
+    def _on_audio_in(self, device_id, pcm):
+        # Called from the listener threads: queue the PCM so the output stream can mix it.
+        if not self.in_video_call:
+            return
+        with self.audio_lock:
+            buf = self.audio_bufs.setdefault(device_id, bytearray())
+            buf.extend(pcm)
+            if len(buf) > AUDIO_RATE * 2:  # more than 1 s queued -> drop the oldest, keep ~0.5 s
+                del buf[:len(buf) - AUDIO_RATE]
+
+    def _audio_out_callback(self, outdata, frames, time_info, status):
+        need = frames * 2
+        mix = np.zeros(frames, dtype=np.int32)
+        with self.audio_lock:
+            for buf in self.audio_bufs.values():
+                if not buf:
+                    continue
+                chunk = bytes(buf[:need])
+                del buf[:need]
+                if len(chunk) < need:
+                    chunk += b"\x00" * (need - len(chunk))
+                mix += np.frombuffer(chunk, dtype=np.int16)
+        outdata[:, 0] = np.clip(mix, -32768, 32767).astype(np.int16)
+
+    # ---- sending to peers ----
+
+    def _broadcast_frame(self, kind, body):
+        """Send one packet (kind byte + body) to every connected peer."""
+        payload = kind + body
+        with self.video_peers_lock:
+            peers = dict(self.video_peers_out)
+        for did, sock in peers.items():
+            try:
+                with self.video_send_lock:
+                    _send_framed(sock, payload)
+            except Exception:
+                with self.video_peers_lock:
+                    self.video_peers_out.pop(did, None)
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
     def _reconcile_video_peers_tick(self):
         if self.in_video_call:
@@ -1341,7 +1534,7 @@ class ChatApp:
     def _reconcile_video_peers(self):
         """Open outgoing connections to any in-call peer we're not yet streaming to."""
         wanted = {did: c["ip"] for did, c in self.contacts.items()
-                 if c.get("in_video_call") and c.get("reachable") == "yes"}
+                  if c.get("in_video_call") and c.get("reachable") == "yes"}
         with self.video_peers_lock:
             existing = set(self.video_peers_out.keys())
         for did, ip in wanted.items():
@@ -1349,6 +1542,7 @@ class ChatApp:
                 continue
             try:
                 sock = socket.create_connection((ip, VIDEO_PORT), timeout=5)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 header = json.dumps({"device_id": DEVICE_ID,
                                      "hostname": self.name_var.get().strip() or socket.gethostname()}
                                     ).encode("utf-8")
@@ -1372,8 +1566,37 @@ class ChatApp:
         # VIDEO_PEER_RECONNECT_MS before the first frame can go anywhere.
         self._reconcile_video_peers()
         frame_interval = 1.0 / VIDEO_FPS
+        last_keepalive = 0.0
         while not self.video_send_thread_stop.is_set():
             start = time.monotonic()
+
+            # keepalive so quiet peers (camera off + muted) aren't timed out
+            if start - last_keepalive > 1.0:
+                self._broadcast_frame(b"K", b"")
+                last_keepalive = start
+
+            # camera switched ON -> (re)open it
+            if self.camera_on and self.video_capture is None:
+                cap = cv2.VideoCapture(0)
+                if cap.isOpened():
+                    self.video_capture = cap
+                else:
+                    cap.release()
+                    self.camera_on = False
+                    self.log("Could not open the camera.")
+                    self.root.after(0, self._update_call_buttons)
+
+            # camera switched OFF -> release it and tell everyone
+            if not self.camera_on:
+                if self.video_capture is not None:
+                    self.video_capture.release()
+                    self.video_capture = None
+                with self.video_frames_lock:
+                    self.video_frames_in[DEVICE_ID] = b""
+                self._broadcast_frame(b"V", b"")
+                time.sleep(0.25)
+                continue
+
             ok, frame = self.video_capture.read()
             if not ok:
                 time.sleep(frame_interval)
@@ -1388,19 +1611,7 @@ class ChatApp:
             jpeg_bytes = buf.tobytes()
             with self.video_frames_lock:
                 self.video_frames_in[DEVICE_ID] = jpeg_bytes  # so our own tile shows our own feed too
-
-            with self.video_peers_lock:
-                peers = dict(self.video_peers_out)
-            for did, sock in peers.items():
-                try:
-                    _send_framed(sock, jpeg_bytes)
-                except Exception:
-                    with self.video_peers_lock:
-                        self.video_peers_out.pop(did, None)
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
+            self._broadcast_frame(b"V", jpeg_bytes)
 
             elapsed = time.monotonic() - start
             time.sleep(max(0.0, frame_interval - elapsed))
