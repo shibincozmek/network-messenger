@@ -508,6 +508,23 @@ def _send_framed(sock, payload_bytes):
     sock.sendall(struct.pack(">I", len(payload_bytes)) + payload_bytes)
 
 
+def open_camera():
+    """Try several camera indexes and Windows backends. Returns a working capture or None."""
+    backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY] if _IS_WINDOWS else [cv2.CAP_ANY]
+    for index in range(4):
+        for backend in backends:
+            try:
+                cap = cv2.VideoCapture(index, backend)
+            except Exception:
+                continue
+            if cap.isOpened():
+                ok, _ = cap.read()   # make sure it really delivers frames
+                if ok:
+                    return cap
+            cap.release()
+    return None
+
+
 class VideoCallListener(threading.Thread):
     """
     Always-on TCP server for incoming call streams. Each connecting peer sends
@@ -642,6 +659,10 @@ class ChatApp:
         self.audio_q = queue.Queue(maxsize=50)   # mic chunks waiting to be sent
         self.audio_bufs = {}                      # device_id -> bytearray of PCM to play
         self.audio_lock = threading.Lock()
+        self.mic_level = 0
+        self._mic_rate = AUDIO_RATE
+        self._out_rate = AUDIO_RATE
+        self.mic_level_var = None
         self.mic_btn = None
         self.cam_btn = None
 
@@ -1192,6 +1213,8 @@ class ChatApp:
         top.pack(fill="x")
         self.call_status_var = tk.StringVar(value="Not in the call yet.")
         ttk.Label(top, textvariable=self.call_status_var).pack(side="left")
+        self.mic_level_var = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.mic_level_var, foreground="#1a7f37").pack(side="left", padx=10)
         self.join_btn = ttk.Button(top, text="📹 Join Call", command=self._join_video_call)
         self.join_btn.pack(side="right")
         self.leave_btn = ttk.Button(top, text="🚪 Leave Call", command=self._leave_video_call)
@@ -1296,6 +1319,17 @@ class ChatApp:
         if self.call_window is not None and self.call_window.winfo_exists():
             with self.video_frames_lock:
                 snapshot = dict(self.video_frames_in)
+            # live mic level meter, so you can SEE whether your mic is picking you up
+            if self.mic_level_var is not None:
+                if not self.in_video_call:
+                    self.mic_level_var.set("")
+                elif self.mic_stream is None:
+                    self.mic_level_var.set("🎙 no microphone")
+                elif not self.mic_on:
+                    self.mic_level_var.set("🔇 muted")
+                else:
+                    bars = min(10, int(self.mic_level / 800))
+                    self.mic_level_var.set("🎙 " + "▮" * bars + "▯" * (10 - bars))
             for did, jpeg_bytes in snapshot.items():
                 tile = self.video_tiles.get(did)
                 if tile is None:
@@ -1346,13 +1380,9 @@ class ChatApp:
             return
         if self.in_video_call:
             return
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            messagebox.showerror("Camera unavailable", "Could not open a webcam (device 0).")
-            cap.release()
-            return
+        cap = open_camera()
         self.video_capture = cap
-        self.camera_on = True
+        self.camera_on = cap is not None   # no camera -> still join, just without your video
         self.mic_on = HAVE_AUDIO
         self.in_video_call = True
         self.video_send_thread_stop.clear()
@@ -1363,7 +1393,12 @@ class ChatApp:
         if not HAVE_AUDIO:
             self.mic_btn.config(state="disabled")
         self._update_call_buttons()
-        self.call_status_var.set("You're in the call.")
+        if cap is None:
+            self.call_status_var.set("You're in the call - no camera found, you can still see and hear everyone.")
+            self.log("No working camera found (is it used by another app, or blocked in "
+                     "Windows Settings > Privacy > Camera?). Joined without video.")
+        else:
+            self.call_status_var.set("You're in the call.")
         self._ensure_call_tile(DEVICE_ID, (self.name_var.get().strip() or "You") + " (You)")
 
         self._start_audio()
@@ -1444,15 +1479,65 @@ class ChatApp:
                 self.audio_q.get_nowait()
             except queue.Empty:
                 break
+        self.mic_level = 0
+        self._mic_rate = AUDIO_RATE
+        self._out_rate = AUDIO_RATE
+
+        # ---- microphone: try the default device, then every input device,
+        # first at 16 kHz and then at the device's own rate (we resample).
+        mic_error = None
+        candidates = [None]
         try:
-            self.mic_stream = sd.InputStream(samplerate=AUDIO_RATE, channels=1, dtype="int16",
-                                             blocksize=AUDIO_BLOCK, callback=self._mic_callback)
-            self.out_stream = sd.OutputStream(samplerate=AUDIO_RATE, channels=1, dtype="int16",
-                                              blocksize=AUDIO_BLOCK, callback=self._audio_out_callback)
-            self.mic_stream.start()
-            self.out_stream.start()
+            for i, d in enumerate(sd.query_devices()):
+                if d["max_input_channels"] > 0:
+                    candidates.append(i)
         except Exception as e:
-            self.log(f"Could not start call audio: {e}")
+            mic_error = e
+        for dev in candidates:
+            for rate in (AUDIO_RATE, None):
+                try:
+                    info = sd.query_devices(kind="input") if dev is None else sd.query_devices(dev)
+                    r = rate or int(info["default_samplerate"])
+                    self._mic_rate = r
+                    stream = sd.InputStream(device=dev, samplerate=r, channels=1, dtype="int16",
+                                            blocksize=int(r * 0.04), callback=self._mic_callback)
+                    stream.start()
+                    self.mic_stream = stream
+                    self.log(f"Microphone: {info['name']} @ {r} Hz")
+                    break
+                except Exception as e:
+                    mic_error = e
+            if self.mic_stream is not None:
+                break
+        if self.mic_stream is None:
+            self.mic_on = False
+            self.log(f"No working microphone: {mic_error}")
+            if self.mic_btn is not None:
+                self.mic_btn.config(state="disabled")
+                self._update_call_buttons()
+            messagebox.showwarning(
+                "Microphone unavailable",
+                "Could not open a microphone, so others will not hear you "
+                "(you can still see and hear them).\n\n"
+                "Check: Windows Settings > Privacy & security > Microphone > "
+                "'Let desktop apps access your microphone' is ON, and that a "
+                "microphone is plugged in / set as the default input.\n\n"
+                f"Details: {mic_error}")
+
+        # ---- speakers
+        for rate in (AUDIO_RATE, None):
+            try:
+                info = sd.query_devices(kind="output")
+                r = rate or int(info["default_samplerate"])
+                self._out_rate = r
+                stream = sd.OutputStream(samplerate=r, channels=1, dtype="int16",
+                                         blocksize=int(r * 0.04), callback=self._audio_out_callback)
+                stream.start()
+                self.out_stream = stream
+                self.log(f"Speakers: {info['name']} @ {r} Hz")
+                break
+            except Exception as e:
+                self.log(f"Could not open speakers at {rate or 'default'} Hz: {e}")
 
     def _stop_audio(self):
         for name in ("mic_stream", "out_stream"):
@@ -1466,11 +1551,18 @@ class ChatApp:
                     pass
 
     def _mic_callback(self, indata, frames, time_info, status):
-        if self.mic_on:
-            try:
-                self.audio_q.put_nowait(indata.tobytes())
-            except queue.Full:
-                pass
+        samples = indata[:, 0]
+        self.mic_level = int(np.abs(samples).max()) if len(samples) else 0  # for the level meter
+        if not self.mic_on:
+            return
+        if self._mic_rate != AUDIO_RATE:  # device isn't 16 kHz -> resample down/up to 16 kHz
+            x = samples.astype(np.float32)
+            n = max(1, int(len(x) * AUDIO_RATE / self._mic_rate))
+            samples = np.interp(np.linspace(0, len(x) - 1, n), np.arange(len(x)), x).astype(np.int16)
+        try:
+            self.audio_q.put_nowait(samples.tobytes())
+        except queue.Full:
+            pass
 
     def _audio_send_loop(self):
         while not self.video_send_thread_stop.is_set():
@@ -1491,8 +1583,10 @@ class ChatApp:
                 del buf[:len(buf) - AUDIO_RATE]
 
     def _audio_out_callback(self, outdata, frames, time_info, status):
-        need = frames * 2
-        mix = np.zeros(frames, dtype=np.int32)
+        # samples we need at 16 kHz to fill this output block
+        src = frames if self._out_rate == AUDIO_RATE else max(1, int(round(frames * AUDIO_RATE / self._out_rate)))
+        need = src * 2
+        mix = np.zeros(src, dtype=np.int32)
         with self.audio_lock:
             for buf in self.audio_bufs.values():
                 if not buf:
@@ -1502,6 +1596,8 @@ class ChatApp:
                 if len(chunk) < need:
                     chunk += b"\x00" * (need - len(chunk))
                 mix += np.frombuffer(chunk, dtype=np.int16)
+        if src != frames:  # speakers aren't 16 kHz -> resample to their rate
+            mix = np.interp(np.linspace(0, src - 1, frames), np.arange(src), mix.astype(np.float32))
         outdata[:, 0] = np.clip(mix, -32768, 32767).astype(np.int16)
 
     # ---- sending to peers ----
@@ -1577,11 +1673,10 @@ class ChatApp:
 
             # camera switched ON -> (re)open it
             if self.camera_on and self.video_capture is None:
-                cap = cv2.VideoCapture(0)
-                if cap.isOpened():
+                cap = open_camera()
+                if cap is not None:
                     self.video_capture = cap
                 else:
-                    cap.release()
                     self.camera_on = False
                     self.log("Could not open the camera.")
                     self.root.after(0, self._update_call_buttons)
